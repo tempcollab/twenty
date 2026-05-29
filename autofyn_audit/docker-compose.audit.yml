@@ -1,0 +1,98 @@
+# Twenty CRM security-audit stack. Pinned by digest for full reproducibility.
+# Image twentycrm/twenty@sha256:fd6faa... == APP_VERSION v2.8.3 (latest as of audit date)
+# Source under audit: repo commit fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8
+#
+# AUDIT NOTE: LOGIC_FUNCTION_TYPE=LOCAL and CODE_INTERPRETER_TYPE=LOCAL are set
+# deliberately to test the vulnerable self-hosted configuration where these defaults
+# apply when NODE_ENV=development. This is not the production Docker default,
+# but IS the default for anyone running `yarn start` from the source repository.
+name: autofyn-audit-twenty
+
+services:
+  audit-twenty-server:
+    image: twentycrm/twenty@sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad
+    container_name: audit-twenty-server
+    volumes:
+      - audit-server-data:/app/packages/twenty-server/.local-storage
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      NODE_PORT: 3000
+      PG_DATABASE_URL: postgres://postgres:postgres@audit-twenty-db:5432/default
+      SERVER_URL: http://localhost:3000
+      REDIS_URL: redis://audit-twenty-redis:6379
+      STORAGE_TYPE: local
+      ENCRYPTION_KEY: bXktYXVkaXQtZW5jcnlwdGlvbi1rZXktMzJieXRlcw==
+      APP_SECRET: bXktYXVkaXQtYXBwLXNlY3JldC1mb3ItdHdlbnR5LWF1ZGl0
+      IS_SIGN_UP_ENABLED: "true"
+      AUTH_PASSWORD_ENABLED: "true"
+      SIGN_IN_PREFILLED: "true"
+      # Vulnerable configuration: LOCAL drivers allow arbitrary code execution
+      LOGIC_FUNCTION_TYPE: LOCAL
+      CODE_INTERPRETER_TYPE: LOCAL
+      # SSRF protection disabled (enables HTTP-based SSRF in addition to TCP-level SSRF)
+      OUTBOUND_HTTP_SAFE_MODE_ENABLED: "false"
+      IS_IMAP_SMTP_CALDAV_CONNECTION_TEST_ENABLED: "true"
+    depends_on:
+      audit-twenty-db:
+        condition: service_healthy
+      audit-twenty-redis:
+        condition: service_healthy
+    healthcheck:
+      test: curl --fail http://localhost:3000/healthz || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    restart: unless-stopped
+
+  audit-twenty-worker:
+    image: twentycrm/twenty@sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad
+    container_name: audit-twenty-worker
+    volumes:
+      - audit-server-data:/app/packages/twenty-server/.local-storage
+    command: ["yarn", "worker:prod"]
+    environment:
+      PG_DATABASE_URL: postgres://postgres:postgres@audit-twenty-db:5432/default
+      SERVER_URL: http://localhost:3000
+      REDIS_URL: redis://audit-twenty-redis:6379
+      DISABLE_DB_MIGRATIONS: "true"
+      DISABLE_CRON_JOBS_REGISTRATION: "true"
+      STORAGE_TYPE: local
+      ENCRYPTION_KEY: bXktYXVkaXQtZW5jcnlwdGlvbi1rZXktMzJieXRlcw==
+      APP_SECRET: bXktYXVkaXQtYXBwLXNlY3JldC1mb3ItdHdlbnR5LWF1ZGl0
+      LOGIC_FUNCTION_TYPE: LOCAL
+      CODE_INTERPRETER_TYPE: LOCAL
+    depends_on:
+      audit-twenty-db:
+        condition: service_healthy
+      audit-twenty-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  audit-twenty-db:
+    image: postgres:16@sha256:4b7183ac05f8ef417db21fd72d71047a4238340c261d3cc3ddb6d579ab5071ae
+    container_name: audit-twenty-db
+    volumes:
+      - audit-db-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: default
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost", "-d", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  audit-twenty-redis:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    container_name: audit-twenty-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  audit-server-data:
+  audit-db-data:
