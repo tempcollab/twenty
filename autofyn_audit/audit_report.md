@@ -9,12 +9,12 @@
 
 ## Executive Summary
 
-This security audit of Twenty CRM identified **7 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. The findings include critical remote code execution paths, authentication bypass issues, token storage flaws, and weak password enforcement.
+This security audit of Twenty CRM identified **10 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. The findings include critical remote code execution paths, authentication bypass issues, token storage flaws, OAuth security issues, and weak password enforcement.
 
 | Severity | Count | Status |
 |----------|-------|--------|
 | CRITICAL | 4 | Confirmed with live exploitation |
-| HIGH | 4 | Confirmed with live exploitation |
+| HIGH | 5 | Confirmed with live exploitation |
 | MEDIUM | 3 | Confirmed / Pattern confirmed in code |
 
 **Key Findings:**
@@ -23,6 +23,7 @@ This security audit of Twenty CRM identified **7 confirmed vulnerabilities** wit
 - Server environment variables (including database credentials) leaked to logic functions
 - Code interpreter exposes full server environment to Python execution
 - Unauthenticated OAuth client registration enables credential phishing
+- Host header injection in OAuth discovery enables OAuth mix-up attacks
 - No rate limiting on login endpoints enables credential brute-forcing
 - User enumeration via public GraphQL query
 - Invitation tokens stored in plaintext, exposing all pending invitations on DB compromise
@@ -402,6 +403,57 @@ curl -X POST -d '{"query":"mutation { signUp(email: \"d@e.f\", password: \"passw
 
 ---
 
+### VULN-012: Host Header Injection in OAuth Discovery (HIGH)
+
+**Severity:** HIGH
+**CVSS 3.1 Score:** 7.5 (High)
+**File:** `packages/twenty-server/src/engine/core-modules/application/application-oauth/controllers/oauth-discovery.controller.ts:98-100`
+
+**Description:**
+The OAuth 2.0 discovery endpoints (`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp`) use `request.get('host')` directly to construct metadata responses without validating against the configured `SERVER_URL`. An attacker who can inject a Host header can make these endpoints return attacker-controlled URLs in OAuth metadata fields.
+
+**Vulnerable Code:**
+```typescript
+// oauth-discovery.controller.ts:98-100
+private getRequestBaseUrl(request: Request): string {
+  return `${request.protocol}://${request.get('host')}`;  // No validation!
+}
+```
+
+**Proof of Concept:**
+```bash
+# Test host header injection
+docker exec audit-twenty-server curl -s -H "Host: attacker.example.com" \
+  "http://localhost:3000/.well-known/oauth-authorization-server"
+
+# Response shows attacker-controlled URLs:
+{
+  "issuer": "http://attacker.example.com",
+  "authorization_endpoint": "http://attacker.example.com/authorize",
+  "token_endpoint": "http://attacker.example.com/oauth/token",
+  "registration_endpoint": "http://attacker.example.com/oauth/register",
+  ...
+}
+```
+
+**Affected Endpoints and Fields:**
+- `/.well-known/oauth-authorization-server`: issuer, authorization_endpoint, token_endpoint, registration_endpoint, revocation_endpoint, introspection_endpoint
+- `/.well-known/oauth-protected-resource`: resource, authorization_servers
+- `/.well-known/oauth-protected-resource/mcp`: resource, authorization_servers
+
+**Impact:**
+- OAuth clients using RFC 8414/9728 auto-discovery receive metadata pointing to attacker's server
+- Authorization codes and tokens can be sent to attacker instead of legitimate server
+- Enables OAuth mix-up attacks when attacker controls network path or DNS
+- MCP (Model Context Protocol) clients also affected via `/mcp` endpoint
+
+**Remediation:**
+1. Use configured `SERVER_URL` environment variable instead of raw Host header
+2. Implement Host header allowlist validation
+3. Reject requests with unrecognized Host headers
+
+---
+
 ## Vulnerability Patterns (Conditionally Exploitable)
 
 ### VULN-006: First User Becomes Server Admin (HIGH)
@@ -466,6 +518,7 @@ When a refresh token is used and marked as revoked, it can still be reused withi
 | P1 | VULN-004: Brute Force | Low | High |
 | P1 | VULN-005: User Enumeration | Low | High |
 | P1 | VULN-010: Invitation Token Plaintext | Low | High |
+| P1 | VULN-012: Host Header Injection | Low | High |
 | P2 | VULN-006: First User Admin | Medium | High |
 | P2 | VULN-007: Token Reuse | Low | Medium |
 | P2 | VULN-011: Weak Password Policy | Low | Medium |
