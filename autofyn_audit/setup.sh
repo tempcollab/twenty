@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup.sh — idempotent audit environment setup
 # Verifies network, pinned image digest, server health, and attacker listener.
-# Target: Twenty CRM commit fc90b4ba | image sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad
+# Target: Twenty CRM release v2.8.3 | image sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad
 
 set -euo pipefail
 
@@ -44,8 +44,9 @@ IMAGE_DIGESTS=$(docker inspect "$CONTAINER_IMAGE_ID" --format '{{range .RepoDige
 if echo "$IMAGE_DIGESTS" | grep -qF "$TWENTY_IMAGE_DIGEST"; then
     echo "  Pinned digest confirmed: ${TWENTY_IMAGE_DIGEST}"
 else
-    echo "[WARN] Pinned digest '${TWENTY_IMAGE_DIGEST}' NOT found in image RepoDigests: ${IMAGE_DIGESTS}"
-    echo "[WARN] Proceeding but image mismatch — results may differ from expected"
+    echo "[ABORT] Pinned digest '${TWENTY_IMAGE_DIGEST}' NOT found in image RepoDigests: ${IMAGE_DIGESTS}" >&2
+    echo "[ABORT] Image mismatch — refusing to run against an unpinned image. Verify the correct image is running." >&2
+    exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,6 @@ echo ""
 echo "=== SETUP OK ==="
 echo "  Network:        ${AUDIT_NET}"
 echo "  Server:         ${SERVER_URL}"
+echo "  Release:        ${TWENTY_RELEASE}"
 echo "  Image digest:   ${TWENTY_IMAGE_DIGEST}"
-echo "  Commit:         ${TWENTY_COMMIT}"
 echo "  Listener:       ${LISTENER_NAME}:${LISTENER_PORT}"

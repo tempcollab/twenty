@@ -1,165 +1,109 @@
-# Twenty CRM Security Audit — 2026-05-29
+# Twenty CRM — Security Audit Report
 
-**Status: PENDING LIVE CONFIRMATION — findings filled only after reviewer runs `run_all.sh` against live.**
-
-## Target
-
-- **Image:** `twentycrm/twenty@sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad`
-- **Commit:** `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8`
-- **Instance:** `http://audit-twenty-server:3000` on docker network `twenty-audit-net`
-- **Date:** 2026-05-29
+**Date:** 2026-05-29
+**Auditor:** AutoFyn security audit team
+**Result:** 1 confirmed finding (Medium). No critical or high-severity exploit was found; several plausible critical vectors were investigated and ruled out (see §4).
 
 ---
 
-## Scope & Rules
-
-- **Audit only.** No fixes applied to the target.
-- **Findings are live-confirmed only.** Suspected code paths insufficient — each finding requires `RESULT=CONFIRMED` from a PoC run against the live pinned instance.
-- **Independent findings.** Each PoC (01, 02, 03) is self-contained and does not depend on another PoC succeeding.
-- **No unrelated containers touched.** Only `audit-attacker-listener` auxiliary infra was created by this audit.
-
----
-
-## Methodology
-
-1. **Static triage** — read source at commit `fc90b4ba` to identify candidate vulnerabilities.
-2. **PoC scripting** — write reproducible shell scripts under `autofyn_audit/exploits/`.
-3. **Live PoC confirmation** — reviewer runs scripts against the live pinned instance.
-
-**How to reproduce:**
-```bash
-bash autofyn_audit/setup.sh      # idempotent; verify network + listener
-bash autofyn_audit/run_all.sh    # run all PoCs; prints RESULT= per exploit
-bash autofyn_audit/teardown.sh   # remove auxiliary infra only
-```
-
-**Authentication note:** All PoCs that require authentication (01, 02) bootstrap by logging in as the seeded workspace member `tim@apple.dev` (password: `tim@apple.dev`). Findings depending on auth are CONFIRMABLE only if this account exists on the target image. If the seeded account is absent, those PoCs will print `NOT-CONFIRMED` with reason `bootstrap unavailable: <reason>` — this is a correct, non-buggy outcome.
-
----
-
-## Environment / Reproducibility
+## 1. Target & Reproducibility
 
 | Item | Value |
 |------|-------|
-| Target image digest | `sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad` |
-| Target commit | `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8` |
-| Docker network | `twenty-audit-net` |
-| Helper image | `curlimages/curl@sha256:b3f1fb2a51d923260350d21b8654bbc607164a987e2f7c84a0ac199a67df812a` |
+| Target Docker image | `twentycrm/twenty@sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad` |
+| Running release | **v2.8.3** (from `/client-config` → `appVersion`) |
+| Repo base commit (audit checkout) | `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8` |
+| Live instance | `http://audit-twenty-server:3000` on docker network `twenty-audit-net` |
+| Helper (attacker) image | `curlimages/curl@sha256:b3f1fb2a51d923260350d21b8654bbc607164a987e2f7c84a0ac199a67df812a` |
 | Listener image | `alpine@sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979713c2d4f` |
-| Listener name | `audit-attacker-listener` |
-| Listener port | `8888` |
+
+> **Version note (important for accuracy).** The repo is checked out at commit `fc90b4ba`, but the *running container* is release **v2.8.3**, whose compiled GraphQL schema and route guards differ from `fc90b4ba`. All API shapes, route patterns, guards, and config defaults cited in this report were verified against the **compiled code inside the running v2.8.3 container** (`/app/packages/twenty-server/dist/...`), not against `fc90b4ba` source.
+
+**Reproduce (fully scripted, against the live pinned instance):**
+```bash
+bash autofyn_audit/setup.sh      # idempotent; verifies pinned digest, health, listener
+bash autofyn_audit/run_all.sh    # runs confirmed PoCs live; prints RESULT= + summary
+bash autofyn_audit/teardown.sh   # removes ONLY the attacker listener; leaves target intact
+```
+`run_all.sh` executes `00_recon` (informational) and `03_user_enumeration_no_captcha` (the confirmed finding). It prints a final `N CONFIRMED / N total` line.
 
 ---
 
-## Findings
+## 2. Scope & Rules of Engagement
+
+- **Audit only** — no changes were made to the target application.
+- **Live-confirmed only** — a vector is reported as a finding ONLY if a PoC produced `RESULT=CONFIRMED` against the live pinned instance. Suspected-but-unconfirmed code paths are listed in §4 as ruled-out or open, never as findings.
+- **Honest severity** — severity reflects real impact in a **default v2.8.3 deployment**. A weakness that is only reachable under a deliberately non-default/misconfigured environment is NOT reported as a product vulnerability.
+- **Independent findings** — each PoC is self-contained.
+- **No collateral** — the only container created by this audit is `audit-attacker-listener`; teardown removes only that.
 
 ---
 
-### Finding 01 — Unauthenticated Webhook Trigger
+## 3. Confirmed Finding
 
-**Title:** Unauthenticated POST to `/webhooks/workflows/:workspaceId/:workflowId` triggers arbitrary workflow execution
+### Finding 03 — Unauthenticated user/email enumeration via `checkUserExists` (no captcha, no rate-limit)
 
-**Status:** PENDING LIVE CONFIRMATION
+**Severity: Medium** (information disclosure; not a direct system compromise).
+**CVSS 3.1:** `AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N` → **5.3 (Medium)**.
 
-**Severity:** `<TBD — fill after live confirmation>`
+**Status: CONFIRMED live.**
 
-**CVSS-style vector:** `<TBD>`
+**Affected component (v2.8.3, compiled):**
+- Auth resolver `checkUserExists(email)` query, served unauthenticated on the **`/metadata`** GraphQL endpoint (in v2.8.3 the `AuthResolver` is a `MetadataResolver`; the resolver is reachable without any token).
+- Captcha is a no-op in default config: the captcha service returns success when no captcha driver is configured. `/client-config` reports `captcha.driver: null` on this instance, confirming no captcha driver is active in the default Docker deployment.
 
-**CVSS rationale:** `<TBD>`
+**Threat model:** Any unauthenticated, remote attacker. No account, token, or victim interaction required.
 
-**Affected component:**
-- File: `packages/twenty-server/src/engine/core-modules/workflow/controllers/workflow-trigger.controller.ts:53-74`
-- Guards: `@UseGuards(PublicEndpointGuard, NoPermissionGuard)`
-- `PublicEndpointGuard.canActivate` returns `true` unconditionally (`engine/guards/public-endpoint.guard.ts:16`)
+**Reproduction:** `bash autofyn_audit/exploits/03_user_enumeration_no_captcha.sh`
+The PoC registers a throwaway account via `signUp` (to obtain a guaranteed-existing email), then issues `checkUserExists` for that email and for a random non-existent email — both **unauthenticated, with no `captchaToken`** — and measures rate-limiting over 30 sequential calls.
 
-**Preconditions:**
-- Attacker knows a valid `workspaceId` and `workflowId` for a published WEBHOOK-triggered workflow.
-- The workflow must be activated (`lastPublishedVersionId` set, version `status=ACTIVE`, trigger `type=WEBHOOK`).
+**Evidence (observed live, v2.8.3):**
+```
+Known-existing email  → {"data":{"checkUserExists":{"exists":true,"isEmailVerified":false}}}
+Random absent email   → {"data":{"checkUserExists":{"exists":false}}}
+Rate-limit            → 30/30 sequential unauthenticated calls succeeded, 0 throttled (~10s)
+RESULT=CONFIRMED exploit=03_user_enumeration_no_captcha :: checkUserExists distinguishes
+  accounts (existing=true absent=false) with no Authorization header and no captchaToken
+  on /metadata; rate_limit=30/30 succeeded (no throttling observed)
+```
 
-**Reproduction steps:** Run `bash autofyn_audit/exploits/01_unauth_webhook_trigger.sh`
+**Impact:** A distinguishable existence oracle lets an attacker confirm whether any given email is registered on the instance. At scale (no captcha and no rate-limit observed) this enables:
+- Building a list of valid accounts for targeted **phishing** and **credential-stuffing / password-spray** campaigns.
+- Confirming whether specific individuals/organizations use the instance.
+The `isEmailVerified` flag additionally leaks per-account verification state.
 
-**Evidence:** `<TBD — paste RESULT=CONFIRMED line + workflowRunId from live run>`
+This is **not** a direct compromise (no auth bypass, no data theft beyond existence/verification state), hence Medium, not High/Critical.
 
-**Impact:** `<TBD — any unauthenticated external caller can trigger workflow execution; depending on workflow steps, this may exfiltrate data, send emails, or chain into further attacks>`
-
-**Remediation:** Require authentication or HMAC signature verification on the webhook endpoint. Add a secret/token to the webhook URL or validate a shared signature header before executing the workflow.
-
-**Independence note:** Self-contained — own workflow created under bootstrap account. Does not depend on 02 or 03.
-
----
-
-### Finding 02 — SSRF via Unauthenticated Webhook-Triggered HTTP_REQUEST Step
-
-**Title:** Unauthenticated webhook trigger drives server-side HTTP request to attacker-controlled host (SSRF)
-
-**Status:** PENDING LIVE CONFIRMATION
-
-**Severity:** `<TBD — fill after live confirmation>`
-
-**CVSS-style vector:** `<TBD>`
-
-**CVSS rationale:** `<TBD>`
-
-**Affected components:**
-- `workflow-trigger.controller.ts:53-74` (unauthenticated trigger — no auth required)
-- HTTP_REQUEST workflow step: server-side outbound HTTP call to step-configured URL
-- `secure-http-client.service.ts`: `OUTBOUND_HTTP_SAFE_MODE_ENABLED` defaults true; blocks private IPs at DNS lookup but allows external hosts
-
-**Preconditions:**
-- Attacker can create a WEBHOOK workflow with an HTTP_REQUEST step (requires authenticated workflow creation — bootstrap account used in PoC).
-- Attacker knows the `workspaceId` and `workflowId` (obtained after creation).
-
-**Reproduction steps:** Run `bash autofyn_audit/exploits/02_ssrf_via_webhook_http_request.sh`
-
-**Evidence:** `<TBD — paste RESULT=CONFIRMED line + SSRF token received at listener>`
-
-**Blast-radius note:** `<TBD — paste informational internal SSRF probe result: BLOCKED or REACHABLE>`
-
-**Impact:** `<TBD — server sends outbound HTTP to attacker-controlled URL without authentication; can be used to bypass `OUTBOUND_HTTP_SAFE_MODE_ENABLED` for external hosts, perform reconnaissance against external services from the server's IP, or exfiltrate internal metadata in future rounds if safe-mode is disabled>`
-
-**Remediation:** Require authentication on the webhook trigger endpoint (see Finding 01 remediation). Additionally, validate and restrict the HTTP_REQUEST step URL at workflow creation time, not only at execution time.
-
-**Independence note:** Self-contained — own workflow with own SSRF token. Does not depend on 01 confirming.
+**Remediation (suggested to maintainers; not applied):**
+1. Configure a captcha driver for `checkUserExists` in production, and add server-side rate-limiting (e.g. `@nestjs/throttler`) keyed on IP for unauthenticated auth-surface queries.
+2. Consider removing the existence oracle entirely (e.g. always return a uniform response, or fold the check into a flow that does not reveal existence).
 
 ---
 
-### Finding 03 — User Enumeration via Unauthenticated `checkUserExists` (No Captcha, No Rate-Limit)
+## 4. Investigated and Ruled Out
 
-**Title:** `checkUserExists` GraphQL query reveals account existence without captcha or rate-limiting
+These vectors were examined against the compiled v2.8.3 code (and, where applicable, probed) and are **not** product vulnerabilities in a default deployment. They are documented for transparency and to scope future work.
 
-**Status:** PENDING LIVE CONFIRMATION
-
-**Severity:** `<TBD — fill after live confirmation>`
-
-**CVSS-style vector:** `<TBD>`
-
-**CVSS rationale:** `<TBD>`
-
-**Affected component:**
-- File: `packages/twenty-server/src/engine/core-modules/auth/auth.resolver.ts:130-138`
-- Guards: `@UseGuards(CaptchaGuard, PublicEndpointGuard, NoPermissionGuard)`
-- `captcha.service.ts:11-19`: returns `{success: true}` when `CAPTCHA_DRIVER` env var is unset — captcha guard always passes in default config
-
-**Preconditions:**
-- `CAPTCHA_DRIVER` env var must be unset (default Docker deployment).
-- No separate rate-limiting middleware on this endpoint.
-
-**Reproduction steps:** Run `bash autofyn_audit/exploits/03_user_enumeration_no_captcha.sh`
-
-**Evidence:** `<TBD — paste RESULT=CONFIRMED line + oracle distinguishability result + rate-limit result>`
-
-**Impact:** `<TBD — attacker can enumerate all registered email addresses via high-volume automated queries; enables targeted phishing and password-spray attacks>`
-
-**Remediation:** Configure `CAPTCHA_DRIVER` in production deployments. Add rate-limiting middleware (e.g. `@nestjs/throttler`) to the `checkUserExists` query. Consider returning a non-distinguishable response to prevent enumeration even with captcha configured.
-
-**Independence note:** Does not require authentication — depends only on the seeded account's email as oracle. Self-contained from 01 and 02.
+| # | Vector | Verdict | Reason (verified in v2.8.3) |
+|---|--------|---------|------------------------------|
+| 01 | Unauthenticated webhook trigger `POST /webhooks/workflows/:workspaceId/:workflowId` | **By design — not a vuln** | The endpoint is intentionally public (`PublicEndpointGuard`). Security rests on two unguessable 122-bit UUIDs (workspace id + workflow id) that the workflow owner shares with their integration, exactly like a GitHub/Stripe webhook URL. An attacker without those UUIDs cannot trigger anything; triggering one's own workflow is not an exploit. |
+| 02 | SSRF via `HTTP_REQUEST` workflow action / `testHttpRequest` | **Not a vuln in default config** | The outbound HTTP client is SSRF-hardened when `OUTBOUND_HTTP_SAFE_MODE_ENABLED` is on, and that flag **defaults to `true`** in v2.8.3 (`config-variables.js`). Only our test container explicitly set it to `false`. A default deployment blocks private-IP/metadata SSRF. Reporting this as a product vuln would be inaccurate. |
+| — | Path traversal on public file route `GET /file/public-assets/:workspaceId/:applicationId/*path` | **Not a vuln** | Four independent defenses: path normalization rejecting `..` segments, a per-segment `^[a-zA-Z0-9._-]+$` allowlist, a DB lookup requiring a matching `file` record before any byte is served, and `realpathSync` + storage-root containment check in the local driver. |
+| — | `/s/*path` public route-trigger (logic functions) | **Not exploitable in default config** | Fully public for all HTTP verbs, but logic-function execution is gated by `LOGIC_FUNCTION_TYPE`, which defaults to `DISABLED` in the standard Docker deployment, so no code executes. (Note for operators: if logic functions are enabled and a route's `isAuthRequired` is false, this becomes an unauthenticated cross-workspace invocation surface — worth hardening, but not exploitable as shipped.) |
+| — | Cross-workspace IDOR / tenant isolation | **Not a vuln** | The active workspace is derived from the verified JWT's `workspaceId` claim (`bindDataToRequestObject`), not from any client-supplied header or argument. Manipulating IDs/Origin does not cross tenants. |
+| — | Password-reset / token flows | **Not a vuln** | Reset tokens use `crypto.randomBytes(32)` (256-bit), are SHA-256-hashed at rest, and expire (5m). JWT verification pins a single-element `algorithms` array, preventing algorithm-confusion. |
+| — | SQL injection in dynamic record API (filter/orderBy) | **Not a vuln** | Filter keys are validated against a server-side metadata field allowlist (`fieldIdByName`) and rejected before any SQL is built; values are TypeORM-parameterized. |
+| — | File-upload stored XSS / upload abuse | **Not a vuln** | Magic-byte content-type detection, DOMPurify sanitization for SVG, and `Content-Disposition: attachment` for non-inline types (SVG is not inline-safe). Defense-in-depth holds. |
 
 ---
 
-## Recon Summary (00_recon — informational, not a finding)
+## 5. Posture Summary
 
-`<TBD — paste RESULT= line from 00_recon live run including bootstrap=ok|unavailable workspaceId introspection signup status>`
+Twenty v2.8.3 is, on the evidence of this audit, **well-hardened** against the common critical classes (SSRF, path traversal, SQLi, IDOR/tenant-isolation, auth-token weaknesses, upload XSS). The one confirmed weakness is an unauthenticated, unthrottled, captcha-less **user-enumeration oracle** (Medium). We deliberately do **not** claim a critical finding where the evidence does not support one.
 
----
-
-*All findings above carry status PENDING LIVE CONFIRMATION. Severity, CVSS vectors, and evidence fields will be filled after the reviewer runs `bash autofyn_audit/run_all.sh` against the live pinned instance and observes `RESULT=CONFIRMED` for each.*
+**Files:**
+- `setup.sh` / `run_all.sh` / `teardown.sh` — scripted setup, live PoC run, and safe teardown.
+- `lib/common.sh` — v2.8.3 auth helpers (`/metadata` endpoint, `signUp`/workspace bootstrap, enumeration oracle helper).
+- `exploits/00_recon.sh` — environment recon (informational).
+- `exploits/03_user_enumeration_no_captcha.sh` — the confirmed Finding 03 PoC.
+- `exploits/01_*`, `exploits/02_*` — retained but marked **RULED OUT** (see §4); excluded from `run_all.sh`.

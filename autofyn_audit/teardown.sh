@@ -2,7 +2,7 @@
 # teardown.sh — remove ONLY audit-created auxiliary infra
 # NEVER touches audit-twenty-* containers or any unrelated containers.
 # Idempotent: safe to run if listener already gone.
-# Target: Twenty CRM commit fc90b4ba | image sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad
+# Target: Twenty CRM release v2.8.3 | image sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad
 
 set -euo pipefail
 

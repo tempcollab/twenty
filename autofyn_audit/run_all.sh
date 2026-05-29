@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_all.sh — run all audit PoCs in order, print summary table
 # Usage: bash run_all.sh [exploit_name]  (e.g. 00_recon, 01, 02, 03)
-# Target: Twenty CRM commit fc90b4ba | image sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad
+# Target: Twenty CRM release v2.8.3 | image sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad
 
 set -euo pipefail
 
@@ -19,12 +19,16 @@ bash "${SCRIPT_DIR}/setup.sh"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Exploit manifest — ordered list
+# Exploit manifest — ordered list of PoCs run against live.
+# 01 (unauth webhook) and 02 (SSRF) are intentionally EXCLUDED: both were
+# investigated and ruled out as product vulnerabilities (webhook trigger is a
+# by-design public endpoint secured by two unguessable UUIDs; SSRF safe mode
+# OUTBOUND_HTTP_SAFE_MODE_ENABLED defaults to ON in v2.8.3 — only our test env
+# disabled it). Their scripts are retained, marked RULED OUT, for transparency.
+# See audit_report.md "Investigated and ruled out".
 # ---------------------------------------------------------------------------
 EXPLOITS=(
     "00_recon.sh"
-    "01_unauth_webhook_trigger.sh"
-    "02_ssrf_via_webhook_http_request.sh"
     "03_user_enumeration_no_captcha.sh"
 )
 
@@ -50,15 +54,28 @@ for exploit_file in "${EXPLOITS[@]}"; do
     TOTAL=$((TOTAL + 1))
     echo "--- Running: ${exploit_name} ---"
 
-    # Run exploit in subshell with timeout; capture RESULT= line; never abort run
+    # Run exploit in subshell with timeout; capture output; never abort run
     set +e
+    EXPLOIT_EXIT=0
     EXPLOIT_OUTPUT=$(timeout "$EXPLOIT_TIMEOUT" bash "$exploit_path" 2>&1) || EXPLOIT_EXIT=$?
     set -e
 
-    # Extract RESULT= line from output
-    RESULT_LINE=$(echo "$EXPLOIT_OUTPUT" | grep '^RESULT=' | tail -1 || echo "RESULT=NOT-CONFIRMED exploit=${exploit_name} :: script_error_or_timeout")
     echo "$EXPLOIT_OUTPUT"
     echo ""
+
+    # Extract the RESULT= line.
+    # Strip ANSI escape sequences before grepping so that color prefixes from
+    # log_pass/log_fail do not break the match (the round-1 ANSI-grep bug).
+    PLAIN_OUTPUT=$(echo "$EXPLOIT_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g')
+    RESULT_LINE=$(echo "$PLAIN_OUTPUT" | grep 'RESULT=' | tail -1 || true)
+
+    if [[ -z "$RESULT_LINE" ]]; then
+        if [[ "$EXPLOIT_EXIT" -eq 124 ]]; then
+            RESULT_LINE="RESULT=NOT-CONFIRMED exploit=${exploit_name} :: timeout after ${EXPLOIT_TIMEOUT}s"
+        else
+            RESULT_LINE="RESULT=NOT-CONFIRMED exploit=${exploit_name} :: script_error exit=${EXPLOIT_EXIT}"
+        fi
+    fi
 
     RESULTS["$exploit_name"]="$RESULT_LINE"
 

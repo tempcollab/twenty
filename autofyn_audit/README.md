@@ -2,7 +2,10 @@
 
 Reproducible audit package for Twenty CRM targeting:
 - **Image:** `twentycrm/twenty@sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad`
-- **Commit:** `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8`
+- **Running release:** `v2.8.3` (API shapes/guards/config defaults verified against the compiled code in the running container)
+- **Repo base commit (audit checkout):** `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8`
+
+See `audit_report.md` for findings. **Confirmed: 1 finding (Medium)** — unauthenticated, captcha-less, unthrottled user enumeration via `checkUserExists`.
 
 ## Usage
 
@@ -14,7 +17,7 @@ bash autofyn_audit/teardown.sh   # Step 3: remove auxiliary infra (listener only
 
 To run a single exploit:
 ```bash
-bash autofyn_audit/run_all.sh 01   # runs only 01_unauth_webhook_trigger
+bash autofyn_audit/run_all.sh 03   # runs only 03_user_enumeration_no_captcha
 ```
 
 ## Prerequisites
@@ -37,20 +40,21 @@ Resolved at build time via `docker images --digests`:
 
 ## Exploit Map
 
-| Script | Vulnerability | Auth Required |
-|--------|--------------|--------------|
-| `00_recon.sh` | Environment recon + bootstrap resolution | No |
-| `01_unauth_webhook_trigger.sh` | Unauthenticated webhook trigger | Bootstrap login |
-| `02_ssrf_via_webhook_http_request.sh` | SSRF via webhook HTTP_REQUEST step | Bootstrap login |
-| `03_user_enumeration_no_captcha.sh` | User enumeration, no captcha | No |
+| Script | Status | Auth Required | Run by run_all.sh |
+|--------|--------|---------------|-------------------|
+| `00_recon.sh` | Informational recon | No | Yes |
+| `03_user_enumeration_no_captcha.sh` | **CONFIRMED (Medium)** — user enumeration, no captcha, no rate-limit | No | Yes |
+| `01_unauth_webhook_trigger.sh` | **RULED OUT** — by-design public endpoint secured by unguessable UUIDs (see `audit_report.md` §4) | n/a | No (excluded) |
+| `02_ssrf_via_webhook_http_request.sh` | **RULED OUT** — SSRF safe-mode defaults ON in v2.8.3; only our test env disabled it (see `audit_report.md` §4) | n/a | No (excluded) |
 
 ## Auth Bootstrap
 
-PoCs 01 and 02 authenticate by logging in as the seeded workspace member:
-- Email: `tim@apple.dev`
-- Password: `tim@apple.dev`
-
-This is a dev-seeder account. If absent on the target (non-dev image), PoCs 01/02 will print `NOT-CONFIRMED` with reason `bootstrap unavailable: <reason>` — this is expected behavior, not a script error.
+The confirmed PoC needs only a known-existing email, obtained via a real `signUp`
+on the `/metadata` endpoint (auth resolvers live at `/metadata`, not `/graphql`,
+in v2.8.3). `lib/common.sh` also provides a full workspace-scoped ACCESS-token
+chain (`signUp` → `signUpInNewWorkspace` → `getAuthTokensFromLoginToken`) for any
+authenticated probing. There is **no** reliance on a seeded `tim@apple.dev`
+account — that dev-seeder account is absent from the production image.
 
 ## Constraints
 
