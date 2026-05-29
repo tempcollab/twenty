@@ -1,0 +1,4 @@
+# Ignore all evidence files (may contain secrets) except the gitkeep marker
+*
+!.gitkeep
+!.gitignore
