@@ -376,6 +376,131 @@ require_bootstrap_or_fail() {
 }
 
 # ---------------------------------------------------------------------------
+# register_second_user — register a second, workspace-agnostic user via signUp.
+#
+# Like register_known_email but also captures the WORKSPACE_AGNOSTIC token for
+# later invitation-acceptance steps.
+#
+# Sets: SECOND_USER_EMAIL, SECOND_USER_PASSWORD, SECOND_USER_AGNOSTIC_TOKEN
+# Returns 0 on success, non-zero on failure.
+# ---------------------------------------------------------------------------
+SECOND_USER_EMAIL=""
+SECOND_USER_PASSWORD=""
+SECOND_USER_AGNOSTIC_TOKEN=""
+register_second_user() {
+    local rand_email="audit-member-${RANDOM}-$(date +%s)@example.com"
+    local password="AuditPoC1234!"
+    local payload
+    payload=$(printf \
+        '{"query":"mutation SignUp($email:String!,$password:String!){signUp(email:$email,password:$password){tokens{accessOrWorkspaceAgnosticToken{token}}}}","variables":{"email":"%s","password":"%s"}}' \
+        "$rand_email" "$password")
+    local resp
+    resp=$(gql_metadata "$payload" 2>/dev/null || echo "")
+    if echo "$resp" | grep -q '"errors"'; then
+        local err
+        err=$(echo "$resp" | (command -v jq &>/dev/null && jq -r '.errors[0].message // .errors[0].extensions.code // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN"))
+        log_info "register_second_user: signUp error — ${err}" >&2
+        log_info "  full response: ${resp:0:400}" >&2
+        SECOND_USER_EMAIL=""
+        SECOND_USER_PASSWORD=""
+        SECOND_USER_AGNOSTIC_TOKEN=""
+        return 1
+    fi
+    local agnostic_token
+    agnostic_token=$(echo "$resp" | (command -v jq &>/dev/null && jq -r '.data.signUp.tokens.accessOrWorkspaceAgnosticToken.token // empty' 2>/dev/null || echo ""))
+    if [[ -z "$agnostic_token" || "$agnostic_token" == "null" ]]; then
+        log_info "register_second_user: got null/empty agnostic token; response: ${resp:0:400}" >&2
+        SECOND_USER_EMAIL=""
+        SECOND_USER_PASSWORD=""
+        SECOND_USER_AGNOSTIC_TOKEN=""
+        return 1
+    fi
+    SECOND_USER_EMAIL="$rand_email"
+    SECOND_USER_PASSWORD="$password"
+    SECOND_USER_AGNOSTIC_TOKEN="$agnostic_token"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# login_access_token — two-step login chain to obtain a workspace-scoped token.
+#
+# Step 1: getLoginTokenFromCredentials(email, password, origin) -> loginToken
+# Step 2: getAuthTokensFromLoginToken(loginToken, origin) -> ACCESS token
+#
+# CRITICAL: All diagnostics go to stderr. Only the raw token string is echoed
+# to stdout — do NOT pollute stdout with anything else (caller captures via $()).
+#
+# Usage: TOKEN=$(login_access_token "email" "password" "https://subdomain.example.com")
+# Returns 0 on success, non-zero on failure (caller must check).
+# ---------------------------------------------------------------------------
+login_access_token() {
+    local email="$1"
+    local password="$2"
+    local origin="$3"
+
+    # Step 1: getLoginTokenFromCredentials
+    local login_payload
+    login_payload=$(printf \
+        '{"query":"mutation GetLoginToken($email:String!,$password:String!,$origin:String!){getLoginTokenFromCredentials(email:$email,password:$password,origin:$origin){loginToken{token}}}","variables":{"email":"%s","password":"%s","origin":"%s"}}' \
+        "$email" "$password" "$origin")
+
+    local login_resp
+    login_resp=$(gql_metadata "$login_payload" 2>/dev/null || echo "")
+
+    if [[ -z "$login_resp" ]]; then
+        echo "login_access_token: step1 no response from server" >&2
+        return 1
+    fi
+
+    if echo "$login_resp" | grep -q '"errors"'; then
+        local err1
+        err1=$(echo "$login_resp" | (command -v jq &>/dev/null && jq -r '.errors[0].message // .errors[0].extensions.code // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN"))
+        echo "login_access_token: step1 error — ${err1}; response: ${login_resp:0:300}" >&2
+        return 1
+    fi
+
+    local login_token
+    login_token=$(echo "$login_resp" | (command -v jq &>/dev/null && jq -r '.data.getLoginTokenFromCredentials.loginToken.token // empty' 2>/dev/null || echo ""))
+
+    if [[ -z "$login_token" || "$login_token" == "null" ]]; then
+        echo "login_access_token: step1 null/empty loginToken; response: ${login_resp:0:300}" >&2
+        return 1
+    fi
+
+    # Step 2: getAuthTokensFromLoginToken
+    local auth_payload
+    auth_payload=$(printf \
+        '{"query":"mutation GetTokens($loginToken:String!,$origin:String!){getAuthTokensFromLoginToken(loginToken:$loginToken,origin:$origin){tokens{accessOrWorkspaceAgnosticToken{token}}}}","variables":{"loginToken":"%s","origin":"%s"}}' \
+        "$login_token" "$origin")
+
+    local auth_resp
+    auth_resp=$(gql_metadata "$auth_payload" 2>/dev/null || echo "")
+
+    if [[ -z "$auth_resp" ]]; then
+        echo "login_access_token: step2 no response from server" >&2
+        return 1
+    fi
+
+    if echo "$auth_resp" | grep -q '"errors"'; then
+        local err2
+        err2=$(echo "$auth_resp" | (command -v jq &>/dev/null && jq -r '.errors[0].message // .errors[0].extensions.code // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN"))
+        echo "login_access_token: step2 error — ${err2}; response: ${auth_resp:0:300}" >&2
+        return 1
+    fi
+
+    local access_token
+    access_token=$(echo "$auth_resp" | (command -v jq &>/dev/null && jq -r '.data.getAuthTokensFromLoginToken.tokens.accessOrWorkspaceAgnosticToken.token // empty' 2>/dev/null || echo ""))
+
+    if [[ -z "$access_token" || "$access_token" == "null" ]]; then
+        echo "login_access_token: step2 null/empty access token; response: ${auth_resp:0:300}" >&2
+        return 1
+    fi
+
+    echo "$access_token"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # signup_user — RECON-ONLY probe; records signup posture
 # Result stored in SIGNUP_RESULT (do NOT use as auth for PoCs 01/02/03)
 # Uses /metadata endpoint (v2.8.3 correct).

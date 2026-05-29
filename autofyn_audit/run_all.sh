@@ -30,6 +30,7 @@ echo ""
 EXPLOITS=(
     "00_recon.sh"
     "03_user_enumeration_no_captcha.sh"
+    "04_system_object_permission_bypass.sh"
 )
 
 # Per-exploit wall-clock cap (seconds)
