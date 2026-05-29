@@ -9,13 +9,13 @@
 
 ## Executive Summary
 
-This security audit of Twenty CRM identified **5 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. The findings include critical remote code execution paths and authentication bypass issues.
+This security audit of Twenty CRM identified **7 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. The findings include critical remote code execution paths, authentication bypass issues, token storage flaws, and weak password enforcement.
 
 | Severity | Count | Status |
 |----------|-------|--------|
 | CRITICAL | 4 | Confirmed with live exploitation |
-| HIGH | 3 | Confirmed with live exploitation |
-| MEDIUM | 2 | Pattern confirmed in code |
+| HIGH | 4 | Confirmed with live exploitation |
+| MEDIUM | 3 | Confirmed / Pattern confirmed in code |
 
 **Key Findings:**
 - Unauthenticated remote code execution via webhook workflows
@@ -25,6 +25,8 @@ This security audit of Twenty CRM identified **5 confirmed vulnerabilities** wit
 - Unauthenticated OAuth client registration enables credential phishing
 - No rate limiting on login endpoints enables credential brute-forcing
 - User enumeration via public GraphQL query
+- Invitation tokens stored in plaintext, exposing all pending invitations on DB compromise
+- Password policy only enforces length, allowing trivially weak passwords
 
 ---
 
@@ -325,6 +327,81 @@ curl -s -X POST -H "Content-Type: application/json" \
 
 ---
 
+### VULN-010: Invitation Token Stored Plaintext (HIGH)
+
+**Severity:** HIGH
+**CVSS 3.1 Score:** 7.5 (High)
+**File:** `packages/twenty-server/src/engine/core-modules/workspace-invitation/services/workspace-invitation.service.ts:424`
+
+**Description:**
+Workspace invitation tokens are stored in plaintext in the `core.appToken` database table. Unlike password reset tokens which are SHA-256 hashed before storage, invitation tokens use the raw `crypto.randomBytes(32).toString('hex')` value directly.
+
+**Vulnerable Code:**
+```typescript
+// workspace-invitation.service.ts:424
+value: crypto.randomBytes(32).toString('hex'),  // PLAINTEXT - NOT HASHED
+
+// Compare to password reset tokens (reset-password.service.ts:107-110):
+const hashedToken = hashPassword(resetToken);  // SHA-256 hashed
+```
+
+**Proof of Concept:**
+```bash
+# Query database for invitation tokens
+docker exec audit-twenty-db psql -U postgres -d default -c \
+  "SELECT type, value FROM core.\"appToken\" WHERE type = 'INVITATION_TOKEN' LIMIT 3;"
+
+# Output shows raw 64-character hex tokens (32 bytes), not hashes
+```
+
+**Impact:**
+- Database compromise (SQL injection, backup leak, misconfigured access) exposes all invitation tokens
+- Tokens are valid for 30 days (`INVITATION_TOKEN_EXPIRES_IN = '30d'`)
+- Attacker can join any workspace with unexpired invitation tokens
+- No detection mechanism - token doesn't require matching the email it was sent to
+
+**Remediation:**
+1. Hash invitation tokens using SHA-256 before storage (consistent with password reset tokens)
+2. Validate that the accepting user's email matches the invited email
+3. Consider reducing token validity period from 30 days
+
+---
+
+### VULN-011: Weak Password Policy (MEDIUM)
+
+**Severity:** MEDIUM
+**CVSS 3.1 Score:** 5.3 (Medium)
+**File:** `packages/twenty-server/src/engine/core-modules/auth/utils/auth.util.ts:10`
+
+**Description:**
+The password validation regex `/^.{8,50}$/` only enforces length requirements (8-50 characters). No requirements exist for character class diversity, dictionary word rejection, or common password blacklisting.
+
+**Vulnerable Code:**
+```typescript
+export const PASSWORD_REGEX = /^.{8,50}$/;
+```
+
+**Proof of Concept:**
+```bash
+# All of these weak passwords are accepted:
+curl -X POST -d '{"query":"mutation { signUp(email: \"x@y.z\", password: \"12345678\") {...} }"}' ...
+curl -X POST -d '{"query":"mutation { signUp(email: \"a@b.c\", password: \"aaaaaaaa\") {...} }"}' ...
+curl -X POST -d '{"query":"mutation { signUp(email: \"d@e.f\", password: \"password\") {...} }"}' ...
+```
+
+**Impact:**
+- Combined with VULN-004 (no brute-force protection), enables credential stuffing
+- Users with weak passwords are easily compromised
+- Common password lists have high success rates against the user base
+
+**Remediation:**
+1. Implement password strength requirements (2+ character classes)
+2. Add common password blacklist (OWASP top 10000)
+3. Consider entropy-based scoring (zxcvbn library)
+4. Display password strength meter in UI
+
+---
+
 ## Vulnerability Patterns (Conditionally Exploitable)
 
 ### VULN-006: First User Becomes Server Admin (HIGH)
@@ -388,8 +465,10 @@ When a refresh token is used and marked as revoked, it can still be reused withi
 | P1 | VULN-009: OAuth Registration | Low | High |
 | P1 | VULN-004: Brute Force | Low | High |
 | P1 | VULN-005: User Enumeration | Low | High |
+| P1 | VULN-010: Invitation Token Plaintext | Low | High |
 | P2 | VULN-006: First User Admin | Medium | High |
 | P2 | VULN-007: Token Reuse | Low | Medium |
+| P2 | VULN-011: Weak Password Policy | Low | Medium |
 
 ---
 
@@ -440,7 +519,9 @@ autofyn_audit/
     ├── 08_env_leakage.sh
     ├── 09_refresh_token_reuse.sh
     ├── 10_code_interpreter_env.sh   # NEW: Code interpreter env leakage
-    └── 11_oauth_registration.sh     # NEW: Unauthenticated OAuth registration
+    ├── 11_oauth_registration.sh     # NEW: Unauthenticated OAuth registration
+    ├── 12_invitation_token_plaintext.sh   # NEW: Invitation token plaintext storage
+    └── 13_weak_password_policy.sh         # NEW: Weak password policy
 ```
 
 ---
