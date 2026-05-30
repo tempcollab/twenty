@@ -6,7 +6,7 @@ Reproducible audit package for Twenty CRM targeting:
 - **Repo base commit (audit checkout):** `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8`
 
 See `audit_report.md` for findings. **Confirmed: 2 findings — 1 CRITICAL + 1 Medium.**
-- **CRITICAL — Finding 04:** system-object RBAC bypass. Any authenticated workspace member with a restricted custom role can read AND write every `isSystem` object (workflow versions/runs, messages, calendar events, blocklists), including workflow-embedded `Authorization: Bearer` secrets. Cross-principal secret read-back + write proven live 3/3 (`04` + blast-radius companion `04b`).
+- **CRITICAL — Finding 04:** system-object RBAC bypass. Any authenticated workspace member with a restricted custom role can read AND write every `isSystem` object lacking an independent visibility layer (workflow versions/runs, message thread subjects, blocklists), including workflow-embedded `Authorization: Bearer` secrets. Cross-principal secret read-back + write proven live 3/3 (`04` + blast-radius companion `04b`). Note: `message` bodies and `calendarEvent` details are independently protected by visibility-restriction hooks (`apply-messages-visibility-restrictions.service`, `apply-calendar-events-visibility-restrictions.service`) that F04 does not bypass — see `audit_report.md` §4.
 - **Medium — Finding 03:** unauthenticated, captcha-less, unthrottled user enumeration via `checkUserExists`.
 
 ## Usage
@@ -47,7 +47,7 @@ In `run_all.sh`, `RESULT=CONFIRMED` means the script's **mechanism reproduced li
 | Script | Status | Auth Required | Run by run_all.sh |
 |--------|--------|---------------|-------------------|
 | `00_recon.sh` | Informational recon | No | Yes |
-| `04_system_object_permission_bypass.sh` | **FINDING — CRITICAL** — system-object RBAC bypass: cross-principal secret read-back + write (3/3) | Yes (restricted member) | Yes |
+| `04_system_object_permission_bypass.sh` | **FINDING — CRITICAL** — system-object RBAC bypass: cross-principal secret read-back + write (deterministic across independent runs) | Yes (restricted member) | Yes |
 | `04b_system_object_blast_radius.sh` | **FINDING — CRITICAL (companion)** — uniform isSystem read bypass across object class | Yes (restricted member) | Yes |
 | `03_user_enumeration_no_captcha.sh` | **FINDING — Medium** — user enumeration, no captcha, no rate-limit | No | Yes |
 | `01_unauth_webhook_trigger.sh` | **RULED OUT** — by-design public endpoint secured by unguessable 122-bit UUIDs (see `audit_report.md` §4) | n/a | Yes (mechanism demo only) |

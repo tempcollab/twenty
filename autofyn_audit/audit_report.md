@@ -43,11 +43,11 @@ bash autofyn_audit/teardown.sh   # removes ONLY the attacker listener; leaves ta
 
 ## 3. Confirmed Findings
 
-### Finding 04 — System-object permission bypass (RBAC bypass: cross-role read/write of all `isSystem` objects including secrets, email bodies, and calendar events)
+### Finding 04 — System-object permission bypass (RBAC bypass: cross-role read/write of all `isSystem` objects, including workflow-embedded secrets and email thread subjects)
 
-**Severity: CRITICAL** (business impact: any authenticated workspace member, regardless of role, can read and modify every system object in the workspace — leaking embedded credentials, email content, and calendar PII, and tampering with automations).
+**Severity: CRITICAL** (business impact: any authenticated workspace member, regardless of role, can read and modify every system object in the workspace — leaking embedded credentials and email thread subjects, and tampering with automations).
 
-**CVSS 3.1:** `AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N` → **8.1 (High)**. Privileges-required is LOW because an authenticated workspace member account is required (PR:None would require no account at all, which is not what the live run demonstrates). The CVSS numeric score is 8.1/High; the qualitative CRITICAL rating reflects the concrete blast radius — secrets, PII, and write access — proven live.
+**CVSS 3.1:** `AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N` → **8.1 (High)**. Privileges-required is LOW because an authenticated workspace member account is required (PR:None would require no account at all, which is not what the live run demonstrates). The CVSS numeric score is 8.1/High; the qualitative CRITICAL rating reflects the concrete blast radius — secrets and write access — proven live.
 
 **Status: CONFIRMED live, deterministic across multiple independent runs** (re-verified 2/2 in the latest independent verification pass; reproduced on every run that reached the test phase).
 
@@ -112,9 +112,11 @@ Blast-radius probe (`04b_system_object_blast_radius.sh`, verified live, **2/2 de
 Object                           Bypassed  Rows
 -------------------------------- --------- -----
 workflowVersions (system)        yes       2     (returns real records including planted secret)
-messageThreads   (system)        yes       0     (no email sync data in audit workspace; no denial)
-calendarEvents   (system)        yes       0     (no calendar sync data; no denial)
-messages/email bodies (system)   yes       0     (no email sync data; no denial)
+messageThreads   (system)        yes       0     (no email sync data in audit workspace; no FORBIDDEN)
+calendarEvents   (system)        yes       0     (ORM check bypassed; independent visibility hook filters
+                                                  events without calendarChannelAssociation — see note)
+messages/email bodies (system)   yes       0     (ORM check bypassed; independent visibility hook throws
+                                                  NOT_FOUND for messages without channelAssociation — see note)
 blocklists       (system)        yes       0     (no denial)
 workflowRuns     (system)        yes       0     (no denial)
 
@@ -123,14 +125,23 @@ people     (non-system)          DENIED    0     (FORBIDDEN/PERMISSION_DENIED)
 workflows  (non-system)          DENIED    0     (FORBIDDEN/PERMISSION_DENIED)
 ```
 
-Empty `edges:[]` for `messageThreads`, `calendarEvents`, `messages`, `blocklists`, and `workflowRuns` reflects the absence of email/calendar integration data in the fresh audit workspace — NOT a denial. The bypass signal is the absence of a FORBIDDEN error, not the row count. In any production workspace with email or calendar sync, these tables hold the most sensitive PII in the product.
+Empty `edges:[]` for `messageThreads`, `calendarEvents`, `messages`, `blocklists`, and `workflowRuns` reflects the absence of integration data in the fresh audit workspace — NOT a denial for the objects without an independent visibility layer. The bypass signal is the absence of a FORBIDDEN error, not the row count.
 
-**Impact:** The bypass spans the full system-object class — read AND write — for any restricted workspace member:
+**Important scope correction (live-tested, round 9):** The ORM `isSystem` bypass reaches the `messages` and `calendarEvents` resolvers, but those resolvers run **independent application-layer visibility hooks** that the bypass does NOT defeat:
+- `apply-messages-visibility-restrictions.service.ts` (dist path: `dist/modules/messaging/common/query-hooks/message/apply-messages-visibility-restrictions.service.js`): throws `NotFoundError('Associated message channels not found')` — failing the entire `messages` query — when a message has no `messageChannelMessageAssociation` row. Even when a channel association exists, it redacts `subject`/`text` to `FIELD_RESTRICTED_ADDITIONAL_PERMISSIONS_REQUIRED` for any principal who is not the connected-account owner (visibility ≠ SHARE_EVERYTHING paths).
+- `apply-calendar-events-visibility-restrictions.service.ts` (dist path: `dist/modules/calendar/common/query-hooks/calendar-event/services/apply-calendar-events-visibility-restrictions.service.js`): splices out (filters to empty) any `calendarEvent` lacking a `calendarChannelEventAssociation` row; redacts `title`/`description` for non-owners when a channel exists.
+
+Live verification (round 9): admin-planted message and calendarEvent records were created successfully; subsequent read — even by the planting admin — returned `{"data":{"messages":null},"errors":[{"message":"Associated message channels not found","extensions":{"code":"NOT_FOUND"}}]}` and empty `calendarEvents.edges`. `messageThread.subject` was the ONLY item the round-9 plant exposed, consistent with 04b evidence: `messageThread` has no visibility hook. **Message bodies and calendar event details are NOT exposed via F04 in a v2.8.3 deployment with or without email/calendar sync.**
+
+**Impact:** The bypass spans the full system-object class — read AND write — for any restricted workspace member. Confirmed exposed objects (no independent visibility layer):
 - **Credentials leak:** workflow-embedded HTTP `Authorization: Bearer` tokens in `workflowVersions.steps`.
-- **Email content:** `messages` (bodies) and `messageThreads` (threads) in any workspace with email sync.
-- **Calendar PII:** `calendarEvents` in any workspace with calendar sync.
+- **Email thread subjects:** `messageThread.subject` (thread-level subjects; no visibility hook on `messageThread`).
 - **Automation tamper:** `workflowVersions` and `workflowRuns` writable by a denied member.
 - **Blocklist exposure:** `blocklists` readable (contact suppression data).
+
+NOT exposed via F04 (independently protected by visibility hooks — see blast-radius note above):
+- `message.subject` / `message.text` (email bodies): blocked by `apply-messages-visibility-restrictions.service` (NOT_FOUND throw or FIELD_RESTRICTED redaction).
+- `calendarEvent` fields (title, description, etc.): filtered to empty by `apply-calendar-events-visibility-restrictions.service`.
 
 Complete breakdown of object-level RBAC for the system-object class. Confidentiality and integrity both compromised.
 
@@ -214,6 +225,8 @@ These vectors were examined against the compiled v2.8.3 code (and, where applica
 | — | SNS/SES inbound webhook subscription-confirmation SSRF | **Not exploitable in default config** | SNS signature verification runs before the subscription-confirmation fetch, and the topic must be in `SES_SNS_TOPIC_ARN_ALLOWLIST` (empty by default → rejected). |
 | — | OAuth `redirectLocation` open redirect (`connection-provider-oauth.controller.ts`) | **Low / not a vuln** | `redirectLocation` is carried in an `APP_SECRET`-signed state JWT and applied via `url.pathname`; the Node `URL.pathname` setter cannot change the host, so the redirect stays same-host. |
 
+| — | **F04 → mass email body / calendar event exfiltration** | **RULED OUT — live-tested round 9** | `message` and `calendarEvent` ARE `isSystem=true`, so the ORM `validateOperationIsPermittedOrThrow` bypass IS reached — but both object types run independent application-layer visibility hooks that F04 does not bypass. `apply-messages-visibility-restrictions.service.ts` (`src/modules/messaging/common/query-hooks/message/apply-messages-visibility-restrictions.service.ts`, line 92–93) throws `NotFoundError('Associated message channels not found')` — failing the entire `messages` query — for any message without a `messageChannelMessageAssociation` row; even with a channel, it redacts `subject`/`text` to `FIELD_RESTRICTED_ADDITIONAL_PERMISSIONS_REQUIRED` for principals who do not own the connected account. `apply-calendar-events-visibility-restrictions.service.ts` (`src/modules/calendar/common/query-hooks/calendar-event/services/apply-calendar-events-visibility-restrictions.service.ts`, line 135) splices (filters out) events without a `calendarChannelEventAssociation`, reducing `edges` to empty. Round-9 live evidence: admin planted nonce-marked `createMessage` + `createCalendarEvent` records (creates succeeded, ids returned); subsequent `messages` read by the same planting admin returned `{"data":{"messages":null},"errors":[{"message":"Associated message channels not found","extensions":{"code":"NOT_FOUND"}}]}`; `calendarEvents` returned empty edges. Only `messageThread.subject` (no visibility hook) read back successfully — consistent with 04b. This is a confirmed negative: F04's confidentiality blast radius does NOT include email bodies or calendar event details. |
+
 > **Round-6 second-finding hunt (transparency).** A dedicated pass over impersonation (`canImpersonate`), the admin panel, SSO/Google/Microsoft OAuth state and `returnToPath` handling, invitation/2FA flows, the REST API, billing/messaging webhooks, row-level permission predicates, and API-key minting found **no additional independent critical/high product vulnerability** beyond Finding 04. The candidates examined are recorded above. This confirms the codebase is otherwise well-defended; Finding 04 stands as the single critical issue.
 
 ---
@@ -222,7 +235,7 @@ These vectors were examined against the compiled v2.8.3 code (and, where applica
 
 This audit confirmed **one CRITICAL object-level RBAC bypass** and **one Medium information-disclosure weakness** against the live v2.8.3 pinned instance.
 
-The CRITICAL finding (Finding 04) is a complete breakdown of role-based record-permission enforcement for the `isSystem=true` object class. Any authenticated workspace member, regardless of role restrictions, can read and write every system object — including workflow-embedded credentials, email message bodies and threads, calendar events, blocklists, and automation run state. The root cause is a single unconditional early-return in compiled server code (`permissions.utils.js`) that predates any role-permission check.
+The CRITICAL finding (Finding 04) is a complete breakdown of role-based record-permission enforcement for the `isSystem=true` object class. Any authenticated workspace member, regardless of role restrictions, can read and write every system object lacking an independent visibility layer — including workflow-embedded credentials, email thread subjects, blocklists, and automation run state. Note: `message` bodies and `calendarEvent` details are NOT exposed via this bypass; they are protected by separate visibility-restriction hooks (`apply-messages-visibility-restrictions.service` / `apply-calendar-events-visibility-restrictions.service`) that operate independently of the ORM permission check (see §4). The root cause is a single unconditional early-return in compiled server code (`permissions.utils.js`) that predates any role-permission check.
 
 The Medium finding (Finding 03) is an unauthenticated email-existence oracle with no captcha and no rate-limit in the default deployment.
 
