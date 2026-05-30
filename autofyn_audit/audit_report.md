@@ -9,7 +9,9 @@
 
 ## Executive Summary
 
-This security audit of Twenty CRM identified **12 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. The findings include critical remote code execution paths, JWT token forgery enabling complete authentication bypass, mass assignment flaws, token storage issues, OAuth security vulnerabilities, and weak password enforcement.
+This security audit of Twenty CRM identified **12 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. More critically, we demonstrated **3 end-to-end exploit chains** that combine these vulnerabilities into real-world attacks achieving complete authentication bypass, OAuth credential theft, and database takeover.
+
+The findings include critical remote code execution paths, JWT token forgery enabling complete authentication bypass, mass assignment flaws, token storage issues, OAuth security vulnerabilities, and weak password enforcement.
 
 | Severity | Count | Status |
 |----------|-------|--------|
@@ -30,6 +32,80 @@ This security audit of Twenty CRM identified **12 confirmed vulnerabilities** wi
 - User enumeration via public GraphQL query
 - Invitation tokens stored in plaintext, exposing all pending invitations on DB compromise
 - Password policy only enforces length, allowing trivially weak passwords
+
+---
+
+## Critical Exploit Chains
+
+These chains demonstrate how multiple vulnerabilities combine into end-to-end critical attacks. Each chain was confirmed against a live instance with full reproducibility.
+
+### CHAIN-01: Secret Theft to Full Admin Access
+
+**Impact:** Complete authentication bypass and workspace takeover from zero credentials
+
+**Vulnerabilities Chained:** VULN-008 → VULN-013 → VULN-014
+
+**Attack Scenario:**
+1. **VULN-008 (Environment Leakage):** Attacker exploits CODE_INTERPRETER_TYPE=LOCAL to leak APP_SECRET, PG_DATABASE_URL, and other server secrets
+2. **VULN-013 (JWT Forgery):** Using leaked APP_SECRET, attacker derives HS256 signing key and forges ACCESS tokens for any user in any workspace
+3. **VULN-014 (Email Spoofing):** With forged admin token, attacker uses mass assignment to change any workspace member's displayed email
+
+**Critical Impact Achieved:**
+- Authentication fully bypassed - no valid credentials required
+- Any user in any workspace can be impersonated
+- Tokens are deterministic and persist across server restarts
+- Complete CRM data access: contacts, deals, emails, notes, exports
+
+**Exploit Script:** `autofyn_audit/exploits/chains/chain_01_secret_theft_to_admin.sh`
+
+---
+
+### CHAIN-02: OAuth Phishing Pipeline
+
+**Impact:** Credential theft from any user via OAuth phishing
+
+**Vulnerabilities Chained:** VULN-009 → VULN-012 → User Enumeration
+
+**Attack Scenario:**
+1. **VULN-009 (OAuth Registration):** Attacker registers malicious OAuth client with `redirect_uris: ["https://attacker.example/callback"]` - no authentication required
+2. **VULN-012 (Host Header Injection):** Attacker poisons OAuth discovery endpoints to point to attacker-controlled server
+3. **User Enumeration:** Attacker harvests valid email addresses from database (via credentials from Chain 01) or other sources
+
+**Attack Flow:**
+- Attacker sends phishing email with legitimate-looking OAuth authorization URL
+- Victim visits URL, sees genuine Twenty CRM consent screen
+- Victim approves, authorization code sent to attacker's redirect URI
+- Attacker exchanges code for victim's access token
+
+**Critical Impact Achieved:**
+- OAuth tokens can be stolen from any user via social engineering
+- Malicious OAuth clients appear on legitimate consent screens
+- Discovery metadata poisoning enables OAuth mix-up attacks
+
+**Exploit Script:** `autofyn_audit/exploits/chains/chain_02_oauth_phishing_pipeline.sh`
+
+---
+
+### CHAIN-03: Unauthenticated RCE to Database Takeover
+
+**Impact:** Remote code execution and full database access without any credentials
+
+**Vulnerabilities Chained:** VULN-001 → VULN-003 → VULN-010 → VULN-013
+
+**Attack Scenario:**
+1. **VULN-001 (Webhook RCE):** Attacker triggers unauthenticated webhook endpoint; if workflow contains CODE action, arbitrary code executes
+2. **VULN-003 (Environment Leakage):** Logic function code reads process.env, exfiltrating PG_DATABASE_URL, APP_SECRET, API keys
+3. **VULN-010 (Invitation Tokens):** Using stolen DB credentials, attacker reads plaintext invitation tokens from core.appToken table
+4. **VULN-013 (JWT Forgery):** Using stolen APP_SECRET, attacker forges JWT tokens for any user
+
+**Critical Impact Achieved:**
+- Remote code execution without authentication
+- Direct database access with stolen credentials
+- Harvest all pending workspace invitation tokens (valid 30 days)
+- Join any workspace with pending invitations
+- Forge tokens for any user across all workspaces
+
+**Exploit Script:** `autofyn_audit/exploits/chains/chain_03_unauthenticated_rce_takeover.sh`
 
 ---
 
@@ -698,7 +774,11 @@ autofyn_audit/
     ├── 13_weak_password_policy.sh         # Weak password policy
     ├── 14_host_header_injection.sh        # OAuth discovery host header injection
     ├── 15_jwt_token_forgery.sh            # JWT HS256 fallback token forgery
-    └── 16_useremail_spoofing.sh           # Mass assignment userEmail spoofing
+    ├── 16_useremail_spoofing.sh           # Mass assignment userEmail spoofing
+    └── chains/
+        ├── chain_01_secret_theft_to_admin.sh  # Full auth bypass chain
+        ├── chain_02_oauth_phishing_pipeline.sh # OAuth credential theft chain
+        └── chain_03_unauthenticated_rce_takeover.sh # RCE to DB takeover chain
 ```
 
 ---
