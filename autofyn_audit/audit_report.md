@@ -9,15 +9,16 @@
 
 ## Executive Summary
 
-This security audit of Twenty CRM identified **12 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. More critically, we demonstrated **3 end-to-end exploit chains** that combine these vulnerabilities into real-world attacks achieving complete authentication bypass, OAuth credential theft, and database takeover.
+This security audit of Twenty CRM identified **14 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. More critically, we demonstrated **3 end-to-end exploit chains** that combine these vulnerabilities into real-world attacks achieving complete authentication bypass, OAuth credential theft, and database takeover.
 
 The findings include critical remote code execution paths, JWT token forgery enabling complete authentication bypass, mass assignment flaws, token storage issues, OAuth security vulnerabilities, and weak password enforcement.
 
 | Severity | Count | Status |
 |----------|-------|--------|
 | CRITICAL | 5 | Confirmed with live exploitation |
-| HIGH | 6 | Confirmed with live exploitation |
-| MEDIUM | 3 | Confirmed / Pattern confirmed in code |
+| HIGH | 7 | Confirmed with live exploitation |
+| MEDIUM | 2 | Confirmed with live exploitation |
+| PATTERN | 2 | Conditionally exploitable (VULN-006, VULN-007) |
 
 **Key Findings:**
 - Unauthenticated remote code execution via webhook workflows
@@ -269,8 +270,8 @@ done
 
 ### VULN-005: User Enumeration via checkUserExists (HIGH)
 
-**Severity:** HIGH
-**CVSS 3.1 Score:** 5.3 (Medium)
+**Severity:** HIGH (elevated from Medium due to combination with VULN-004)
+**CVSS 3.1 Score:** 5.3 (Medium standalone)
 **File:** `packages/twenty-server/src/engine/core-modules/auth/auth.resolver.ts:130-137`
 
 **Description:**
@@ -532,58 +533,6 @@ docker exec audit-twenty-server curl -s -H "Host: attacker.example.com" \
 
 ---
 
-## Vulnerability Patterns (Conditionally Exploitable)
-
-### VULN-006: First User Becomes Server Admin (HIGH)
-
-**Severity:** HIGH (when exploitable)
-**File:** `packages/twenty-server/src/engine/core-modules/auth/services/sign-in-up.service.ts:499,562-563`
-
-**Description:**
-The first user to register on a fresh Twenty instance (or after all admins are deleted) automatically receives full server admin privileges including:
-- `canImpersonate: true` - can impersonate any user
-- `canAccessFullAdminPanel: true` - full admin access
-
-**Vulnerable Code:**
-```typescript
-const shouldGrantServerAdmin = !(await this.hasServerAdmin());
-if (shouldGrantServerAdmin) {
-  // Grant canImpersonate: true, canAccessFullAdminPanel: true
-}
-```
-
-**Impact:**
-- Privilege escalation on fresh or misconfigured deployments
-- TOCTOU race condition could grant admin to multiple concurrent signups
-- Admin deletion exposes the vulnerability again
-
-**Remediation:**
-1. Require explicit admin bootstrapping via CLI or environment variable
-2. Log warnings when hasServerAdmin() returns false
-3. Require additional verification for admin privilege grants
-
----
-
-### VULN-007: Refresh Token Grace Period Allows Reuse (MEDIUM)
-
-**Severity:** MEDIUM
-**File:** `packages/twenty-server/src/engine/core-modules/auth/token/services/refresh-token.service.ts:82-97`
-
-**Description:**
-When a refresh token is used and marked as revoked, it can still be reused within `REFRESH_TOKEN_COOL_DOWN_PERIOD` (default: 86400 seconds = 24 hours). A stolen refresh token remains valid even after the legitimate user has rotated their tokens.
-
-**Impact:**
-- Stolen tokens remain valid for 24 hours after revocation
-- Session hijacking persists through token rotation
-- Attackers maintain access despite victim's logout
-
-**Remediation:**
-1. Reduce grace period to 5 minutes or less
-2. Implement token binding (tie to device/IP)
-3. Use token family tracking to detect concurrent use
-
----
-
 ### VULN-013: JWT Token Forgery via HS256 Fallback (CRITICAL)
 
 **Severity:** CRITICAL
@@ -698,6 +647,60 @@ curl -s -X POST \
 2. Use explicit allowlist of modifiable fields instead of blocklist
 3. Separate endpoints for profile self-update vs admin member management
 4. Log all userEmail changes with audit trail
+
+---
+
+## Vulnerability Patterns (Conditionally Exploitable)
+
+These vulnerabilities are confirmed in code but require specific conditions to exploit (fresh instance, token theft, etc.).
+
+### VULN-006: First User Becomes Server Admin (HIGH)
+
+**Severity:** HIGH (when exploitable)
+**File:** `packages/twenty-server/src/engine/core-modules/auth/services/sign-in-up.service.ts:499,562-563`
+
+**Description:**
+The first user to register on a fresh Twenty instance (or after all admins are deleted) automatically receives full server admin privileges including:
+- `canImpersonate: true` - can impersonate any user
+- `canAccessFullAdminPanel: true` - full admin access
+
+**Vulnerable Code:**
+```typescript
+const shouldGrantServerAdmin = !(await this.hasServerAdmin());
+if (shouldGrantServerAdmin) {
+  // Grant canImpersonate: true, canAccessFullAdminPanel: true
+}
+```
+
+**Impact:**
+- Privilege escalation on fresh or misconfigured deployments
+- TOCTOU race condition could grant admin to multiple concurrent signups
+- Admin deletion exposes the vulnerability again
+
+**Remediation:**
+1. Require explicit admin bootstrapping via CLI or environment variable
+2. Log warnings when hasServerAdmin() returns false
+3. Require additional verification for admin privilege grants
+
+---
+
+### VULN-007: Refresh Token Grace Period Allows Reuse (MEDIUM)
+
+**Severity:** MEDIUM
+**File:** `packages/twenty-server/src/engine/core-modules/auth/token/services/refresh-token.service.ts:82-97`
+
+**Description:**
+When a refresh token is used and marked as revoked, it can still be reused within `REFRESH_TOKEN_COOL_DOWN_PERIOD` (default: 86400 seconds = 24 hours). A stolen refresh token remains valid even after the legitimate user has rotated their tokens.
+
+**Impact:**
+- Stolen tokens remain valid for 24 hours after revocation
+- Session hijacking persists through token rotation
+- Attackers maintain access despite victim's logout
+
+**Remediation:**
+1. Reduce grace period to 5 minutes or less
+2. Implement token binding (tie to device/IP)
+3. Use token family tracking to detect concurrent use
 
 ---
 
