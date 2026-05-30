@@ -9,15 +9,15 @@
 
 ## Executive Summary
 
-This security audit of Twenty CRM identified **14 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. More critically, we demonstrated **3 end-to-end exploit chains** that combine these vulnerabilities into real-world attacks achieving complete authentication bypass, OAuth credential theft, and database takeover.
+This security audit of Twenty CRM identified **12 confirmed vulnerabilities** with live proof-of-concept exploitation, plus **2 additional vulnerability patterns** that are exploitable under specific configurations. More critically, we demonstrated **3 end-to-end exploit chains** that combine these vulnerabilities into real-world attacks achieving complete authentication bypass, OAuth credential theft, and database takeover.
 
 The findings include critical remote code execution paths, JWT token forgery enabling complete authentication bypass, mass assignment flaws, token storage issues, OAuth security vulnerabilities, and weak password enforcement.
 
 | Severity | Count | Status |
 |----------|-------|--------|
 | CRITICAL | 5 | Confirmed with live exploitation |
-| HIGH | 7 | Confirmed with live exploitation |
-| MEDIUM | 2 | Confirmed with live exploitation |
+| HIGH | 6 | Confirmed with live exploitation |
+| MEDIUM | 1 | Confirmed with live exploitation |
 | PATTERN | 2 | Conditionally exploitable (VULN-006, VULN-007) |
 
 **Key Findings:**
