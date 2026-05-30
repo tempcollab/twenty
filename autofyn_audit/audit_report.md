@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-30
 **Auditor:** AutoFyn security audit team
-**Result:** 2 confirmed findings: 1 CRITICAL (system-object RBAC bypass) + 1 Medium (user enumeration). Several plausible critical vectors were investigated and ruled out (see §4).
+**Result:** 2 confirmed findings: 1 CRITICAL (system-object RBAC bypass) + 1 Medium (user enumeration). The CRITICAL finding is demonstrated end-to-end as a **live kill-chain** (restricted member → steals an admin's workflow Bearer credential via the RBAC bypass → replays it for authorized access to an external API), confirmed 2/2 deterministically against the live instance — see "Finding 04 — Exploit Chain" in §3. Several plausible critical vectors were investigated and ruled out (see §4).
 
 ---
 
@@ -136,6 +136,22 @@ Complete breakdown of object-level RBAC for the system-object class. Confidentia
 
 **Remediation (suggested to maintainers; not applied):**
 Remove the blanket `isSystem` early-return in `validateOperationIsPermittedOrThrow` so that system objects pass through the same `canReadObjectRecords`/`canUpdateObjectRecords`/`canSoftDeleteObjectRecords`/`canDestroyObjectRecords` enforcement as non-system objects. Treat `workspaceMember` as the narrow, documented exception rather than the entire `isSystem` class. If specific system objects must be world-readable within a workspace for operational reasons, add an explicit audited allowlist of object names — not a blanket class exemption.
+
+#### Finding 04 — Exploit Chain: end-to-end external-account compromise (impact proof)
+
+**The isolated F04 read-bypass is sometimes dismissed as "just a readable field." This chain proves the read yields a LIVE external credential.**
+
+End-to-end, in default v2.8.3 config:
+
+1. Admin builds a legitimate automation: a workflow HTTP_REQUEST step authenticating to a third-party API with `Authorization: Bearer <LIVE_SECRET>` (modeled by a mock service we stand up on the audit network that returns `PROTECTED-DATA-<nonce>` only for the exact token, 401 otherwise).
+2. A lowest-privilege insider (custom role, `canReadAllObjectRecords=false`) — entry is authenticated PR:Low, exactly like F04, NOT unauth — reads the admin's Bearer token out of `workflowVersions{steps...headers.Authorization}` via the F04 `isSystem` bypass, despite having no role permission to read workflows (same member is correctly DENIED on `companies`).
+3. The attacker replays the stolen token directly against the third-party API and receives `PROTECTED-DATA-<nonce>`; the same request with no token is denied (401). The stolen credential grants live external access as the victim org.
+
+**PoC:** `exploits/chain_01_workflow_secret_to_external_compromise.sh`. When all chain signals hold, the script prints `RESULT=CONFIRMED … restricted member … stole an admin workflow Bearer credential via the F04 isSystem RBAC bypass and replayed it for live access to an external API (got PROTECTED-DATA); no-token control denied`. Per-run nonces (`SUPERSECRET-<32hex>` / `PROTECTED-DATA-<32hex>`) — values differ each run; described in format, not pinned. **Live status: CONFIRMED, deterministic 2/2** in independent verification. Both runs: the restricted member's own response contained the planted `SUPERSECRET-<nonce>` (proven via `grep -qF` on the member's raw response, not the admin's), the same member was DENIED on `companies` (`FORBIDDEN`/`PERMISSION_DENIED`), the replay WITH the stolen token returned HTTP 200 + `PROTECTED-DATA-<nonce>` (AUTHORIZED), and the replay WITHOUT the token returned HTTP 401 + body `DENIED` (genuine negative control — no false positive). The mock is a single-connection `nc -lk -e handler` responder (an earlier two-`nc`-per-request model returned no HTTP response to curl and was replaced).
+
+**Note (honest scope):** The server-side variant (member writes a malicious HTTP step then triggers it so the Twenty server exfiltrates the secret) is BLOCKED by `SettingsPermissionGuard(WORKFLOWS)` at the workflow resolvers — independent of the ORM bypass. We therefore use client-side replay of the stolen credential, which is what works in default config and is the realistic attacker action. This chain does NOT add a new vulnerability; it elevates F04's demonstrated impact from "readable system-object field" to "compromise of an external account/credential held by the org," reinforcing the existing CRITICAL rating (no CVSS change required; the impact narrative is strengthened).
+
+*Optional recon context:* Finding 03 (unauth user enumeration) provides a pre-authenticated recon step — an attacker can enumerate whether a target org uses a Twenty instance before seeking a low-privilege workspace seat. This is framed as optional recon context only; it is not part of the confirmed chain, and the chain's confirmed boundary is authenticated PR:Low.
 
 ---
 
