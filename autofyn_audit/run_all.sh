@@ -20,17 +20,27 @@ echo ""
 
 # ---------------------------------------------------------------------------
 # Exploit manifest — ordered list of PoCs run against live.
-# 01 (unauth webhook) and 02 (SSRF) are intentionally EXCLUDED: both were
-# investigated and ruled out as product vulnerabilities (webhook trigger is a
-# by-design public endpoint secured by two unguessable UUIDs; SSRF safe mode
-# OUTBOUND_HTTP_SAFE_MODE_ENABLED defaults to ON in v2.8.3 — only our test env
-# disabled it). Their scripts are retained, marked RULED OUT, for transparency.
-# See audit_report.md "Investigated and ruled out".
+# CONFIRMED FINDINGS (reported in audit_report.md §3):
+#   03  (Medium) unauth captcha-less user enumeration — reproduces every run.
+#   04  (CRITICAL) system-object RBAC bypass: cross-privilege secret plant + read-back + write.
+#   04b (CRITICAL) system-object RBAC bypass: blast radius across all isSystem objects.
+#       04/04b require the worker container running (metadata sync) and call
+#       reclaim_workspace_slots internally.
+# RULED-OUT MECHANISM DEMOS (NOT findings — see audit_report.md §4):
+#   01  unauth webhook trigger — public-by-design, gated on two unguessable UUIDs;
+#       does NOT reproduce as an exploit without those secrets (typically NOT-CONFIRMED).
+#   02  SSRF via HTTP_REQUEST — only reachable when the non-default
+#       OUTBOUND_HTTP_SAFE_MODE_ENABLED=false; intermittent on this container.
+#   Kept in the runner only so maintainers can observe the underlying behavior;
+#   their RESULT line is NOT a product-vulnerability claim.
 # ---------------------------------------------------------------------------
 EXPLOITS=(
     "00_recon.sh"
+    "01_unauth_webhook_trigger.sh"
+    "02_ssrf_via_webhook_http_request.sh"
     "03_user_enumeration_no_captcha.sh"
     "04_system_object_permission_bypass.sh"
+    "04b_system_object_blast_radius.sh"
 )
 
 # Per-exploit wall-clock cap (seconds)

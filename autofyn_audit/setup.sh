@@ -71,6 +71,52 @@ if [[ "$HEALTH_OK" != "true" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 3b: Reclaim workspace slots in the audit DB (idempotent)
+#
+# Every bootstrap run creates a new core.workspace row and never reclaims it.
+# The free/community edition caps the instance at 5 total workspaces.  After
+# a few audit runs the cap is hit and signUpInNewWorkspace returns ENV_SATURATED.
+# We wipe PENDING_CREATION orphans and cap the total at 2 so there are always
+# ≥3 free slots for the exploit suite.
+#
+# The audit DB is disposable infrastructure we created; no exploit depends on a
+# pre-existing workspace (each self-bootstraps).  FKs are ON DELETE CASCADE so
+# deleting workspace rows is safe.
+# ---------------------------------------------------------------------------
+echo "=== [3b] Reclaiming workspace slots in audit DB ==="
+
+if docker inspect audit-twenty-db &>/dev/null 2>&1; then
+    # Delete PENDING_CREATION orphans (failed/partial bootstraps)
+    PENDING_DELETED=$(docker exec audit-twenty-db \
+        psql -U postgres -d default -t -c \
+        "DELETE FROM core.workspace WHERE \"activationStatus\"='PENDING_CREATION' RETURNING id;" \
+        2>/dev/null | grep -c '[0-9a-f]' || echo "0")
+    echo "  Deleted PENDING_CREATION orphans: ${PENDING_DELETED}"
+
+    # Ensure at most 2 active workspace rows remain (leaves ≥3 free of the 5-cap)
+    WS_COUNT=$(docker exec audit-twenty-db \
+        psql -U postgres -d default -t -c \
+        "SELECT count(*) FROM core.workspace;" \
+        2>/dev/null | tr -d '[:space:]' || echo "0")
+    echo "  Current workspace count: ${WS_COUNT}"
+
+    if [[ -n "$WS_COUNT" && "$WS_COUNT" -ge 3 ]]; then
+        # Calculate how many rows to remove: keep the 2 newest, delete the rest
+        DELETE_N=$(( WS_COUNT - 2 ))
+        echo "  Trimming ${DELETE_N} oldest workspace row(s) to reach count=2..."
+        TRIMMED=$(docker exec audit-twenty-db \
+            psql -U postgres -d default -t -c \
+            "DELETE FROM core.workspace WHERE id IN (SELECT id FROM core.workspace ORDER BY \"createdAt\" ASC LIMIT ${DELETE_N}) RETURNING id;" \
+            2>/dev/null | grep -c '[0-9a-f]' || echo "0")
+        echo "  Trimmed ${TRIMMED} workspace row(s)"
+    else
+        echo "  Workspace count within limit — no trim needed"
+    fi
+else
+    echo "  [SKIP] audit-twenty-db container not found — skipping slot reclaim (not an audit-DB environment)"
+fi
+
+# ---------------------------------------------------------------------------
 # Step 4: Stand up attacker listener container
 # ---------------------------------------------------------------------------
 echo "=== [4/5] Setting up attacker listener '${LISTENER_NAME}' ==="

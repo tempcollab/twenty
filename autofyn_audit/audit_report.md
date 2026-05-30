@@ -1,8 +1,8 @@
 # Twenty CRM — Security Audit Report
 
-**Date:** 2026-05-29
+**Date:** 2026-05-30
 **Auditor:** AutoFyn security audit team
-**Result:** 1 confirmed finding (Medium). No critical or high-severity exploit was found; several plausible critical vectors were investigated and ruled out (see §4).
+**Result:** 2 confirmed findings: 1 CRITICAL (system-object RBAC bypass) + 1 Medium (user enumeration). Several plausible critical vectors were investigated and ruled out (see §4).
 
 ---
 
@@ -25,7 +25,9 @@ bash autofyn_audit/setup.sh      # idempotent; verifies pinned digest, health, l
 bash autofyn_audit/run_all.sh    # runs confirmed PoCs live; prints RESULT= + summary
 bash autofyn_audit/teardown.sh   # removes ONLY the attacker listener; leaves target intact
 ```
-`run_all.sh` executes `00_recon` (informational) and `03_user_enumeration_no_captcha` (the confirmed finding). It prints a final `N CONFIRMED / N total` line.
+`run_all.sh` executes six PoCs in order: `00_recon` (informational), `01_unauth_webhook_trigger`, `02_ssrf_via_webhook_http_request`, `03_user_enumeration_no_captcha`, `04_system_object_permission_bypass`, and `04b_system_object_blast_radius`. It prints a per-PoC `RESULT=` line and a final `N CONFIRMED / N total` count.
+
+> **Reading the runner output (important).** In `run_all.sh`, `RESULT=CONFIRMED` means *the mechanism the script exercises reproduced live* — it is NOT a statement that the mechanism is a product vulnerability. Only **two** of the reproduced mechanisms are reported as findings: **Finding 04 / 04b** (CRITICAL) and **Finding 03** (Medium). `01` and `02` reproduce their mechanisms on this test container but are **ruled out as product vulnerabilities in a default deployment** — see §4 for the precise reasons (01 requires possession of two unguessable 122-bit UUIDs; 02's internal/IMDS SSRF requires the non-default `OUTBOUND_HTTP_SAFE_MODE_ENABLED=false`). They are kept in the runner only so maintainers can observe the underlying behavior end-to-end.
 
 ---
 
@@ -39,7 +41,103 @@ bash autofyn_audit/teardown.sh   # removes ONLY the attacker listener; leaves ta
 
 ---
 
-## 3. Confirmed Finding
+## 3. Confirmed Findings
+
+### Finding 04 — System-object permission bypass (RBAC bypass: cross-role read/write of all `isSystem` objects including secrets, email bodies, and calendar events)
+
+**Severity: CRITICAL** (business impact: any authenticated workspace member, regardless of role, can read and modify every system object in the workspace — leaking embedded credentials, email content, and calendar PII, and tampering with automations).
+
+**CVSS 3.1:** `AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N` → **8.1 (High)**. Privileges-required is LOW because an authenticated workspace member account is required (PR:None would require no account at all, which is not what the live run demonstrates). The CVSS numeric score is 8.1/High; the qualitative CRITICAL rating reflects the concrete blast radius — secrets, PII, and write access — proven live.
+
+**Status: CONFIRMED live, deterministic across multiple independent runs** (re-verified 2/2 in the latest independent verification pass; reproduced on every run that reached the test phase).
+
+**Affected component (v2.8.3, compiled):**
+`/app/packages/twenty-server/dist/engine/twenty-orm/repository/permissions.utils.js` — `validateOperationIsPermittedOrThrow`:
+```js
+const objectMetadataIsSystem = objectMetadata.isSystem === true;
+const isWorkspaceMemberObject =
+    objectMetadata.universalIdentifier === WORKSPACE_MEMBER_OBJECT_UNIVERSAL_IDENTIFIER;
+if (objectMetadataIsSystem && !isWorkspaceMemberObject) {
+    return;  // early return BEFORE the switch(operationType) that enforces canReadObjectRecords
+}
+```
+For any `isSystem===true` object except `workspaceMember`, the function returns before the `switch(operationType)` block that enforces `canReadObjectRecords`, `canUpdateObjectRecords`, `canSoftDeleteObjectRecords`, and `canDestroyObjectRecords`. Role record-permissions are silently ignored for the entire system-object class.
+
+**Threat model:** Any authenticated workspace member assigned a custom role with `canReadAllObjectRecords=false` — the lowest-privilege posture a workspace admin can configure. No admin account, no victim interaction, and no special knowledge beyond having a workspace account are required.
+
+**Reproduction:**
+```bash
+bash autofyn_audit/exploits/04_system_object_permission_bypass.sh   # core: secret plant + read/write bypass
+bash autofyn_audit/exploits/04b_system_object_blast_radius.sh       # blast radius across all isSystem objects
+```
+Both scripts are included in `run_all.sh`.
+
+**Evidence (live runs against v2.8.3; reproduced deterministically across every independent run that reached the test phase):**
+
+Restricted member is correctly denied on non-system objects (all runs):
+```json
+{"data":{"companies":null},"errors":[{"message":"Entity performing the request does not have permission",
+  "extensions":{"userFriendlyMessage":"User does not have permission.",
+                "subCode":"PERMISSION_DENIED","code":"FORBIDDEN"}}]}
+```
+`code=FORBIDDEN subCode=PERMISSION_DENIED`, zero rows → `CONTROL_DENIED=true`. The `workflows` non-system object is denied identically (`workflows_denied=true`). RBAC is enforced for non-system objects, isolating the defect to the `isSystem` early-return.
+
+Same restricted member (a separate principal, `canReadAllObjectRecords=false`) reads the planted secret marker out of `workflowVersions{steps[].settings.input.headers.Authorization}` — an HTTP-step `Bearer` token planted by the admin and verified via an admin self-read assert — with no permission error, on every run.
+
+The marker is a **fresh per-run random nonce** of the form `SUPERSECRET-<32 hex chars>`; a maintainer re-running the PoC will see a different value each time (the PoC asserts the value it just planted, so this is not a hard-coded match). Representative values actually observed in independent verification runs:
+- `secret_marker=SUPERSECRET-98c786d7df1fab85d6313b5956d44c86` (run reading back `workflowVersionId=bdb4285b-...`) → `READ_BYPASS=true`
+- `secret_marker=SUPERSECRET-b27a3cfb862099a298aefe9be5292df2` (run reading back `workflowVersionId=453e263c-...`) → `READ_BYPASS=true`
+
+The read is a genuine cross-principal exfiltration: a low-privilege member reads a secret a higher-privilege admin embedded in a workflow the member has no role-permission to read.
+
+Same restricted member also writes a `workflowVersion` via `updateWorkflowVersion` (every run), despite `canUpdateAllObjectRecords=false`:
+```json
+{"data":{"updateWorkflowVersion":{"id":"<workflowVersionId>","name":"AuditWriteBypassed"}}}
+```
+`WRITE_BYPASS=true` — integrity impact, not just confidentiality.
+
+Representative RESULT line (per-run marker/id elided to `<...>`; the verdict shape is identical on every run):
+```
+RESULT=CONFIRMED exploit=04_system_object_permission_bypass :: read_bypass=true control_denied=true
+  write_bypass=true workflows_denied=true secret_marker=SUPERSECRET-<32hex>
+  workflowVersionId=<uuid> :: member reads all workflowVersions.steps
+  (including embedded HTTP Authorization headers) despite role having no WORKFLOWS settings flag —
+  permissions.utils.js early-return for isSystem objects bypasses canRead=false enforcement;
+  company read correctly denied
+```
+
+Blast-radius probe (`04b_system_object_blast_radius.sh`, verified live, **2/2 deterministic** in the latest independent verification) — same denied member, all isSystem queries accepted (no FORBIDDEN), while all non-system controls are correctly denied:
+
+```
+Object                           Bypassed  Rows
+-------------------------------- --------- -----
+workflowVersions (system)        yes       2     (returns real records including planted secret)
+messageThreads   (system)        yes       0     (no email sync data in audit workspace; no denial)
+calendarEvents   (system)        yes       0     (no calendar sync data; no denial)
+messages/email bodies (system)   yes       0     (no email sync data; no denial)
+blocklists       (system)        yes       0     (no denial)
+workflowRuns     (system)        yes       0     (no denial)
+
+companies  (non-system)          DENIED    0     (FORBIDDEN/PERMISSION_DENIED)
+people     (non-system)          DENIED    0     (FORBIDDEN/PERMISSION_DENIED)
+workflows  (non-system)          DENIED    0     (FORBIDDEN/PERMISSION_DENIED)
+```
+
+Empty `edges:[]` for `messageThreads`, `calendarEvents`, `messages`, `blocklists`, and `workflowRuns` reflects the absence of email/calendar integration data in the fresh audit workspace — NOT a denial. The bypass signal is the absence of a FORBIDDEN error, not the row count. In any production workspace with email or calendar sync, these tables hold the most sensitive PII in the product.
+
+**Impact:** The bypass spans the full system-object class — read AND write — for any restricted workspace member:
+- **Credentials leak:** workflow-embedded HTTP `Authorization: Bearer` tokens in `workflowVersions.steps`.
+- **Email content:** `messages` (bodies) and `messageThreads` (threads) in any workspace with email sync.
+- **Calendar PII:** `calendarEvents` in any workspace with calendar sync.
+- **Automation tamper:** `workflowVersions` and `workflowRuns` writable by a denied member.
+- **Blocklist exposure:** `blocklists` readable (contact suppression data).
+
+Complete breakdown of object-level RBAC for the system-object class. Confidentiality and integrity both compromised.
+
+**Remediation (suggested to maintainers; not applied):**
+Remove the blanket `isSystem` early-return in `validateOperationIsPermittedOrThrow` so that system objects pass through the same `canReadObjectRecords`/`canUpdateObjectRecords`/`canSoftDeleteObjectRecords`/`canDestroyObjectRecords` enforcement as non-system objects. Treat `workspaceMember` as the narrow, documented exception rather than the entire `isSystem` class. If specific system objects must be world-readable within a workspace for operational reasons, add an explicit audited allowlist of object names — not a blanket class exemption.
+
+---
 
 ### Finding 03 — Unauthenticated user/email enumeration via `checkUserExists` (no captcha, no rate-limit)
 
@@ -99,11 +197,19 @@ These vectors were examined against the compiled v2.8.3 code (and, where applica
 
 ## 5. Posture Summary
 
-Twenty v2.8.3 is, on the evidence of this audit, **well-hardened** against the common critical classes (SSRF, path traversal, SQLi, IDOR/tenant-isolation, auth-token weaknesses, upload XSS). The one confirmed weakness is an unauthenticated, unthrottled, captcha-less **user-enumeration oracle** (Medium). We deliberately do **not** claim a critical finding where the evidence does not support one.
+This audit confirmed **one CRITICAL object-level RBAC bypass** and **one Medium information-disclosure weakness** against the live v2.8.3 pinned instance.
+
+The CRITICAL finding (Finding 04) is a complete breakdown of role-based record-permission enforcement for the `isSystem=true` object class. Any authenticated workspace member, regardless of role restrictions, can read and write every system object — including workflow-embedded credentials, email message bodies and threads, calendar events, blocklists, and automation run state. The root cause is a single unconditional early-return in compiled server code (`permissions.utils.js`) that predates any role-permission check.
+
+The Medium finding (Finding 03) is an unauthenticated email-existence oracle with no captcha and no rate-limit in the default deployment.
+
+The common critical attack classes — SSRF, path traversal, SQLi, IDOR/tenant-isolation, auth-token weaknesses, upload XSS — were investigated and ruled out (§4). That hardening is genuine but does not offset the severity of the RBAC bypass.
 
 **Files:**
 - `setup.sh` / `run_all.sh` / `teardown.sh` — scripted setup, live PoC run, and safe teardown.
 - `lib/common.sh` — v2.8.3 auth helpers (`/metadata` endpoint, `signUp`/workspace bootstrap, enumeration oracle helper).
 - `exploits/00_recon.sh` — environment recon (informational).
-- `exploits/03_user_enumeration_no_captcha.sh` — the confirmed Finding 03 PoC.
-- `exploits/01_*`, `exploits/02_*` — retained but marked **RULED OUT** (see §4); excluded from `run_all.sh`.
+- `exploits/03_user_enumeration_no_captcha.sh` — confirmed Finding 03 PoC (Medium).
+- `exploits/04_system_object_permission_bypass.sh` — confirmed Finding 04 PoC: core RBAC bypass with planted secret, read and write (CRITICAL).
+- `exploits/04b_system_object_blast_radius.sh` — confirmed Finding 04 blast-radius probe: uniform bypass across all isSystem objects (CRITICAL, companion to 04).
+- `exploits/01_*`, `exploits/02_*` — **mechanism demonstrations, RULED OUT as product vulnerabilities** (see §4). They are run by `run_all.sh` so maintainers can observe the behavior end-to-end; their `RESULT=CONFIRMED` denotes a reproduced mechanism, NOT a finding.

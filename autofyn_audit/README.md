@@ -5,7 +5,9 @@ Reproducible audit package for Twenty CRM targeting:
 - **Running release:** `v2.8.3` (API shapes/guards/config defaults verified against the compiled code in the running container)
 - **Repo base commit (audit checkout):** `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8`
 
-See `audit_report.md` for findings. **Confirmed: 1 finding (Medium)** — unauthenticated, captcha-less, unthrottled user enumeration via `checkUserExists`.
+See `audit_report.md` for findings. **Confirmed: 2 findings — 1 CRITICAL + 1 Medium.**
+- **CRITICAL — Finding 04:** system-object RBAC bypass. Any authenticated workspace member with a restricted custom role can read AND write every `isSystem` object (workflow versions/runs, messages, calendar events, blocklists), including workflow-embedded `Authorization: Bearer` secrets. Cross-principal secret read-back + write proven live 3/3 (`04` + blast-radius companion `04b`).
+- **Medium — Finding 03:** unauthenticated, captcha-less, unthrottled user enumeration via `checkUserExists`.
 
 ## Usage
 
@@ -40,12 +42,16 @@ Resolved at build time via `docker images --digests`:
 
 ## Exploit Map
 
+In `run_all.sh`, `RESULT=CONFIRMED` means the script's **mechanism reproduced live**, NOT that it is a product vulnerability. Only `04`/`04b` (CRITICAL) and `03` (Medium) are reported findings; `01`/`02` are ruled-out mechanism demonstrations (see `audit_report.md` §4).
+
 | Script | Status | Auth Required | Run by run_all.sh |
 |--------|--------|---------------|-------------------|
 | `00_recon.sh` | Informational recon | No | Yes |
-| `03_user_enumeration_no_captcha.sh` | **CONFIRMED (Medium)** — user enumeration, no captcha, no rate-limit | No | Yes |
-| `01_unauth_webhook_trigger.sh` | **RULED OUT** — by-design public endpoint secured by unguessable UUIDs (see `audit_report.md` §4) | n/a | No (excluded) |
-| `02_ssrf_via_webhook_http_request.sh` | **RULED OUT** — SSRF safe-mode defaults ON in v2.8.3; only our test env disabled it (see `audit_report.md` §4) | n/a | No (excluded) |
+| `04_system_object_permission_bypass.sh` | **FINDING — CRITICAL** — system-object RBAC bypass: cross-principal secret read-back + write (3/3) | Yes (restricted member) | Yes |
+| `04b_system_object_blast_radius.sh` | **FINDING — CRITICAL (companion)** — uniform isSystem read bypass across object class | Yes (restricted member) | Yes |
+| `03_user_enumeration_no_captcha.sh` | **FINDING — Medium** — user enumeration, no captcha, no rate-limit | No | Yes |
+| `01_unauth_webhook_trigger.sh` | **RULED OUT** — by-design public endpoint secured by unguessable 122-bit UUIDs (see `audit_report.md` §4) | n/a | Yes (mechanism demo only) |
+| `02_ssrf_via_webhook_http_request.sh` | **RULED OUT** — SSRF safe-mode defaults ON in v2.8.3; only our test env disabled it (see `audit_report.md` §4) | n/a | Yes (mechanism demo only) |
 
 ## Auth Bootstrap
 

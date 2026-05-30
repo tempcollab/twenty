@@ -250,7 +250,13 @@ bootstrap_access_token() {
     if echo "$new_ws_resp" | grep -q '"errors"'; then
         local err2
         err2=$(json_get "$new_ws_resp" '.errors[0].message // .errors[0].extensions.code // "UNKNOWN"')
-        BOOTSTRAP_STATUS="step2_error:${err2}"
+        # Distinguish workspace-cap saturation from other step2 errors so callers can
+        # tell environment problems from refuted vulnerabilities.
+        if echo "$new_ws_resp" | grep -qF "Cannot create more than 5 workspaces"; then
+            BOOTSTRAP_STATUS="ENV_SATURATED (workspace cap reached)"
+        else
+            BOOTSTRAP_STATUS="step2_error:${err2}"
+        fi
         log_info "bootstrap_access_token: step2 error — ${err2}"
         log_info "  full response: ${new_ws_resp:0:400}"
         return 1
@@ -290,21 +296,38 @@ bootstrap_access_token() {
         '{"query":"mutation GetTokens($loginToken:String!,$origin:String!){getAuthTokensFromLoginToken(loginToken:$loginToken,origin:$origin){tokens{accessOrWorkspaceAgnosticToken{token}}}}","variables":{"loginToken":"%s","origin":"%s"}}' \
         "$login_token" "$subdomain_url")
 
-    local auth_resp
-    auth_resp=$(gql_metadata "$auth_payload" 2>/dev/null || echo "")
+    # Retry on WORKSPACE_NOT_FOUND: a freshly created workspace is occasionally not yet
+    # visible to the token-exchange resolver (creation race). Retry only that error.
+    local auth_resp="" err3="" step3_try
+    for step3_try in $(seq 1 10); do
+        auth_resp=$(gql_metadata "$auth_payload" 2>/dev/null || echo "")
 
-    if [[ -z "$auth_resp" ]]; then
-        BOOTSTRAP_STATUS="step3_no_response"
-        log_info "bootstrap_access_token: step3 error — no response from server"
-        return 1
-    fi
+        if [[ -z "$auth_resp" ]]; then
+            log_info "bootstrap_access_token: step3 try ${step3_try} — no response, retrying"
+            sleep 2
+            continue
+        fi
 
-    if echo "$auth_resp" | grep -q '"errors"'; then
-        local err3
-        err3=$(json_get "$auth_resp" '.errors[0].message // .errors[0].extensions.code // "UNKNOWN"')
-        BOOTSTRAP_STATUS="step3_error:${err3}"
-        log_info "bootstrap_access_token: step3 error — ${err3}"
-        log_info "  full response: ${auth_resp:0:400}"
+        if echo "$auth_resp" | grep -q '"errors"'; then
+            err3=$(json_get "$auth_resp" '.errors[0].message // .errors[0].extensions.code // "UNKNOWN"')
+            if echo "$err3" | grep -qi 'WORKSPACE_NOT_FOUND\|workspace not found'; then
+                log_info "bootstrap_access_token: step3 try ${step3_try} — WORKSPACE_NOT_FOUND (creation race), retrying"
+                sleep 2
+                continue
+            fi
+            BOOTSTRAP_STATUS="step3_error:${err3}"
+            log_info "bootstrap_access_token: step3 error — ${err3}"
+            log_info "  full response: ${auth_resp:0:400}"
+            return 1
+        fi
+
+        # No errors — proceed.
+        break
+    done
+
+    if [[ -z "$auth_resp" ]] || echo "$auth_resp" | grep -q '"errors"'; then
+        BOOTSTRAP_STATUS="step3_error:${err3:-WORKSPACE_NOT_FOUND_retries_exhausted}"
+        log_info "bootstrap_access_token: step3 — retries exhausted (${err3:-WORKSPACE_NOT_FOUND})"
         return 1
     fi
 
@@ -315,6 +338,130 @@ bootstrap_access_token() {
         BOOTSTRAP_STATUS="step3_null_access_token"
         log_info "bootstrap_access_token: step3 — got null/empty ACCESS token"
         log_info "  full response: ${auth_resp:0:400}"
+        return 1
+    fi
+
+    # NOTE: Do NOT set BOOTSTRAP_TOKEN here (pre-activation token lacks workspaceMember
+    # context and fails actor guard on record creates). BOOTSTRAP_* globals are set
+    # after step 5 (re-mint post-activation). Keep local vars for the activation call.
+
+    # Step 4: activateWorkspace — Twenty only syncs standard object metadata
+    # (the ~24 core.objectMetadata rows incl. workflowVersion) at workspace
+    # activation.  The workspace stays PENDING_CREATION with ZERO objectMetadata
+    # until this mutation is called, so any exploit that queries metadata objects
+    # will see an empty list without this step.
+    # Guarded by WorkspaceAuthGuard — requires the workspace-scoped access token.
+    log_info "bootstrap_access_token: step 4 — activateWorkspace on /graphql (workspaceId=${workspace_id})"
+
+    # Use jq -n --arg to build the payload — NO inline \" quoting (prior C1 lesson).
+    local activate_payload
+    activate_payload=$(jq -n \
+        --arg displayName "Audit WS ${workspace_id}" \
+        '{query: "mutation ActivateWS($displayName:String!){activateWorkspace(data:{displayName:$displayName}){id}}", variables: {displayName: $displayName}}')
+
+    local activate_resp
+    activate_resp=$(gql_auth "$access_token" "$activate_payload" 2>/dev/null || echo "")
+
+    if [[ -z "$activate_resp" ]]; then
+        log_info "bootstrap_access_token: step4 no response from /graphql — trying /metadata" >&2
+        activate_resp=$(gql_metadata_auth "$access_token" "$activate_payload" 2>/dev/null || echo "")
+    fi
+
+    # If /graphql returns "Cannot query field" for activateWorkspace, fall back to /metadata
+    if echo "$activate_resp" | grep -qF "Cannot query field"; then
+        log_info "bootstrap_access_token: step4 /graphql lacks activateWorkspace — retrying on /metadata" >&2
+        activate_resp=$(gql_metadata_auth "$access_token" "$activate_payload" 2>/dev/null || echo "")
+    fi
+
+    if [[ -z "$activate_resp" ]]; then
+        BOOTSTRAP_STATUS="step4_no_response"
+        log_info "bootstrap_access_token: step4 error — no response from server on either endpoint" >&2
+        return 1
+    fi
+
+    if echo "$activate_resp" | grep -q '"errors"'; then
+        local err4
+        err4=$(json_get "$activate_resp" '.errors[0].message // .errors[0].extensions.code // "UNKNOWN"')
+        BOOTSTRAP_STATUS="step4_error:${err4}"
+        log_info "bootstrap_access_token: step4 error — ${err4}" >&2
+        log_info "  full response: ${activate_resp:0:400}" >&2
+        return 1
+    fi
+
+    log_info "bootstrap_access_token: step4 OK — workspace activated (response: ${activate_resp:0:200})"
+
+    # Step 5: Re-mint the ACCESS token AFTER activateWorkspace.
+    # The token created in step 3 (before activation) has no workspaceMember in its
+    # auth context.  Any record create that injects an actor (createdBy/updatedBy)
+    # fails with INTERNAL_SERVER_ERROR "Unable to build actor metadata".
+    # After activation the server creates the workspaceMember row; the re-minted
+    # token carries it and satisfies the actor guard.
+    log_info "bootstrap_access_token: step 5 — re-minting ACCESS token post-activation (origin=${subdomain_url})"
+
+    local post_activate_token
+    set +e
+    post_activate_token=$(login_access_token "$rand_email" "$password" "$subdomain_url" 2>/dev/null)
+    local post_login_exit=$?
+    set -e
+
+    if [[ "$post_login_exit" -ne 0 || -z "$post_activate_token" || "$post_activate_token" == "null" ]]; then
+        BOOTSTRAP_STATUS="step5_post_activate_login_failed"
+        log_info "bootstrap_access_token: step5 error — re-mint after activation failed; actor guard will block record creates" >&2
+        return 1
+    fi
+    access_token="$post_activate_token"
+    log_info "bootstrap_access_token: step5 OK — ACCESS token re-minted with workspaceMember context"
+
+    # Step 6: Poll for object metadata readiness.
+    # The worker container syncs the standard object metadata rows asynchronously
+    # after activation.  We poll until BOTH conditions hold (max 20 × 3s = 60s):
+    #   (a) /metadata objects list includes a node with nameSingular=="workflowVersion"
+    #       AND nameSingular=="company" (indicating full standard-object sync)
+    #   (b) /graphql workflowVersions query returns WITHOUT "Cannot query field"
+    # The old nodes>=1 check raced because it returned before workflowVersion synced.
+    log_info "bootstrap_access_token: step 6 — polling for metadata readiness (workflowVersion + graphql queryable, max 60s)"
+
+    # Fetch all objects and filter client-side — ObjectFilter does NOT support nameSingular
+    local poll_objects_payload
+    poll_objects_payload='{"query":"query{objects(paging:{first:200}){edges{node{nameSingular isSystem}}}}"}'
+    local poll_wfv_payload
+    poll_wfv_payload='{"query":"query{workflowVersions(first:1){edges{node{id}}}}"}'
+
+    local meta_ready=false
+    local poll_attempt
+    for poll_attempt in $(seq 1 20); do
+        local poll_meta_resp
+        poll_meta_resp=$(gql_metadata_auth "$access_token" "$poll_objects_payload" 2>/dev/null || echo "")
+
+        local has_wfv
+        has_wfv=$(json_get "$poll_meta_resp" \
+            '([.data.objects.edges[].node | select(.nameSingular == "workflowVersion")] | length > 0)' \
+            2>/dev/null || echo "false")
+        local has_company
+        has_company=$(json_get "$poll_meta_resp" \
+            '([.data.objects.edges[].node | select(.nameSingular == "company")] | length > 0)' \
+            2>/dev/null || echo "false")
+
+        if [[ "$has_wfv" == "true" && "$has_company" == "true" ]]; then
+            # Confirm data API is also ready: workflowVersions must not return "Cannot query field"
+            local poll_gql_resp
+            poll_gql_resp=$(gql_auth "$access_token" "$poll_wfv_payload" 2>/dev/null || echo "")
+            if ! echo "$poll_gql_resp" | grep -qF "Cannot query field"; then
+                meta_ready=true
+                log_info "bootstrap_access_token: step6 OK — metadata synced (attempt ${poll_attempt}, workflowVersion=true, company=true, /graphql queryable)"
+                break
+            else
+                log_info "bootstrap_access_token: step6 attempt ${poll_attempt}/20 — metadata objects ready but /graphql workflowVersions not yet queryable..."
+            fi
+        else
+            log_info "bootstrap_access_token: step6 attempt ${poll_attempt}/20 — waiting for metadata sync (workflowVersion=${has_wfv} company=${has_company})..."
+        fi
+        sleep 3
+    done
+
+    if [[ "$meta_ready" != "true" ]]; then
+        BOOTSTRAP_STATUS="step6_metadata_timeout"
+        log_info "bootstrap_access_token: step6 error — workflowVersion/company objects never fully synced after 60s; worker container may not be running" >&2
         return 1
     fi
 
@@ -498,6 +645,60 @@ login_access_token() {
 
     echo "$access_token"
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# gen_uuid — generate a random UUID v4 (for negative-control test values)
+# ---------------------------------------------------------------------------
+gen_uuid() {
+    if command -v uuidgen &>/dev/null; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+    else
+        # POSIX fallback via /dev/urandom
+        local hex
+        hex=$(head -c 16 /dev/urandom | od -A n -t x1 | tr -d ' \n')
+        printf '%s-%s-%s-%s-%s\n' \
+            "${hex:0:8}" "${hex:8:4}" \
+            "4${hex:13:3}" \
+            "$(printf '%x' $(( (0x${hex:16:2} & 0x3f) | 0x80 )))${hex:18:2}" \
+            "${hex:20:12}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# reclaim_workspace_slots — delete PENDING_CREATION orphans and trim to 2
+# active workspaces so repeated standalone runs do not saturate the 5-cap.
+# Mirrors the identical logic in setup.sh Step 3b.
+# No-ops silently if audit-twenty-db container is not present.
+# ---------------------------------------------------------------------------
+reclaim_workspace_slots() {
+    if ! docker inspect audit-twenty-db &>/dev/null 2>&1; then
+        return 0
+    fi
+
+    local pending_deleted
+    pending_deleted=$(docker exec audit-twenty-db \
+        psql -U postgres -d default -t -c \
+        "DELETE FROM core.workspace WHERE \"activationStatus\"='PENDING_CREATION' RETURNING id;" \
+        2>/dev/null | grep -c '[0-9a-f]' || echo "0")
+    log_info "reclaim_workspace_slots: deleted PENDING_CREATION orphans=${pending_deleted}"
+
+    local ws_count
+    ws_count=$(docker exec audit-twenty-db \
+        psql -U postgres -d default -t -c \
+        "SELECT count(*) FROM core.workspace;" \
+        2>/dev/null | tr -d '[:space:]' || echo "0")
+    log_info "reclaim_workspace_slots: current workspace count=${ws_count}"
+
+    if [[ -n "$ws_count" && "$ws_count" -ge 3 ]]; then
+        local delete_n=$(( ws_count - 2 ))
+        local trimmed
+        trimmed=$(docker exec audit-twenty-db \
+            psql -U postgres -d default -t -c \
+            "DELETE FROM core.workspace WHERE id IN (SELECT id FROM core.workspace ORDER BY \"createdAt\" ASC LIMIT ${delete_n}) RETURNING id;" \
+            2>/dev/null | grep -c '[0-9a-f]' || echo "0")
+        log_info "reclaim_workspace_slots: trimmed ${trimmed} oldest workspace row(s)"
+    fi
 }
 
 # ---------------------------------------------------------------------------
