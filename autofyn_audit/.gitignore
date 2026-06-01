@@ -1,0 +1,7 @@
+# Runtime state artifacts — not for version control
+lib/.state/
+lib/.state/created.json
+
+# Temporary files
+*.tmp
+*.log
