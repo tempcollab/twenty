@@ -5,9 +5,9 @@ Reproducible audit package for Twenty CRM targeting:
 - **Running release:** `v2.8.3` (API shapes/guards/config defaults verified against the compiled code in the running container)
 - **Repo base commit (audit checkout):** `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8`
 
-See `audit_report.md` for findings. **Confirmed: 2 findings — 1 CRITICAL + 1 Medium.**
-- **CRITICAL — Finding 04:** system-object RBAC bypass. Any authenticated workspace member with a restricted custom role can read AND write every `isSystem` object lacking an independent visibility layer (workflow versions/runs, message thread subjects, blocklists), including workflow-embedded `Authorization: Bearer` secrets. Cross-principal secret read-back + write proven live 3/3 (`04` + blast-radius companion `04b`). Note: `message` bodies and `calendarEvent` details are independently protected by visibility-restriction hooks (`apply-messages-visibility-restrictions.service`, `apply-calendar-events-visibility-restrictions.service`) that F04 does not bypass — see `audit_report.md` §4.
-- **Medium — Finding 03:** unauthenticated, captcha-less, unthrottled user enumeration via `checkUserExists`.
+See `audit_report.md` for findings. **Confirmed: 2 findings — 1 HIGH + 1 Low/Informational.**
+- **HIGH — Finding 04:** workflow-object RBAC bypass. A workspace member whose role lacks the `WORKFLOWS` settings permission (cache-computed `canRead=false`, correctly denied on the dedicated workflow resolvers) can still read AND write `workflow`/`workflowRun`/`workflowVersion` via the generic GraphQL data API, because `validateOperationIsPermittedOrThrow` early-returns for `isSystem` objects before consulting the computed permission. Impact: exfiltration of workflow-embedded `Authorization: Bearer` secrets (replayable against the external API) and automation tampering — proven live end-to-end (`04`, blast-radius companion `04b`, and impact chain `chain_01`). Scope note: the early-return mechanically reaches all `isSystem` objects, but only the workflow-related class is an actual escalation — other `isSystem` objects (`blocklist`, `messageThread`) are workspace-readable by design and cannot be restricted by any role; `message`/`calendarEvent` are independently protected by visibility hooks. See `audit_report.md` §3–§4.
+- **Low/Informational — Finding 03:** unauthenticated, captcha-less, unthrottled user enumeration via `checkUserExists` — an accepted-risk UX pattern with a shipped opt-in captcha mitigation.
 
 ## Usage
 
@@ -42,14 +42,15 @@ Resolved at build time via `docker images --digests`:
 
 ## Exploit Map
 
-In `run_all.sh`, `RESULT=CONFIRMED` means the script's **mechanism reproduced live**, NOT that it is a product vulnerability. Only `04`/`04b` (CRITICAL) and `03` (Medium) are reported findings; `01`/`02` are ruled-out mechanism demonstrations (see `audit_report.md` §4).
+In `run_all.sh`, `RESULT=CONFIRMED` means the script's **mechanism reproduced live**, NOT that it is a product vulnerability. Only `04`/`04b` (HIGH) and `03` (Low/Informational) are reported findings; `01`/`02` are ruled-out mechanism demonstrations (see `audit_report.md` §4).
 
 | Script | Status | Auth Required | Run by run_all.sh |
 |--------|--------|---------------|-------------------|
 | `00_recon.sh` | Informational recon | No | Yes |
-| `04_system_object_permission_bypass.sh` | **FINDING — CRITICAL** — system-object RBAC bypass: cross-principal secret read-back + write (deterministic across independent runs) | Yes (restricted member) | Yes |
-| `04b_system_object_blast_radius.sh` | **FINDING — CRITICAL (companion)** — uniform isSystem read bypass across object class | Yes (restricted member) | Yes |
-| `03_user_enumeration_no_captcha.sh` | **FINDING — Medium** — user enumeration, no captcha, no rate-limit | No | Yes |
+| `04_system_object_permission_bypass.sh` | **FINDING — HIGH** — workflow-object RBAC bypass: cross-principal secret read-back + write (deterministic across independent runs) | Yes (restricted member) | Yes |
+| `04b_system_object_blast_radius.sh` | **FINDING — HIGH (companion)** — mechanism probe: early-return reaches all isSystem objects (only workflow class is an escalation) | Yes (restricted member) | Yes |
+| `chain_01_workflow_secret_to_external_compromise.sh` | **FINDING — HIGH (impact proof)** — stolen workflow Bearer token replayed for live external-API access | Yes (restricted member) | No (run separately; manages own mock) |
+| `03_user_enumeration_no_captcha.sh` | **FINDING — Low/Informational** — user enumeration, no captcha, no rate-limit | No | Yes |
 | `01_unauth_webhook_trigger.sh` | **RULED OUT** — by-design public endpoint secured by unguessable 122-bit UUIDs (see `audit_report.md` §4) | n/a | Yes (mechanism demo only) |
 | `02_ssrf_via_webhook_http_request.sh` | **RULED OUT** — SSRF safe-mode defaults ON in v2.8.3; only our test env disabled it (see `audit_report.md` §4) | n/a | Yes (mechanism demo only) |
 

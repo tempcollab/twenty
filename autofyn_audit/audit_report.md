@@ -1,251 +1,259 @@
-# Twenty CRM — Security Audit Report
+# Security Audit Report: Twenty CRM
+
+**Audit Firm:** AutoFyn SignalPilot
+
+**Audit Model:** Claude Opus 4.8 (Anthropic)
+
+**Target:** Twenty CRM (https://github.com/twentyhq/twenty)
+
+**Repository:** `twenty`
+
+**Commit Reviewed:** Running release `v2.8.3` (image `twentycrm/twenty@sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad`); source verified against repo commit `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8`
 
 **Date:** 2026-05-30
-**Auditor:** AutoFyn security audit team
-**Result:** 2 confirmed findings: 1 CRITICAL (system-object RBAC bypass) + 1 Medium (user enumeration). The CRITICAL finding is demonstrated end-to-end as a **live kill-chain** (restricted member → steals an admin's workflow Bearer credential via the RBAC bypass → replays it for authorized access to an external API), confirmed 2/2 deterministically against the live instance — see "Finding 04 — Exploit Chain" in §3. Several plausible critical vectors were investigated and ruled out (see §4).
+
+**Status:** 1 High Vulnerability Confirmed + 1 Low/Informational + 1 End-to-End Exploit Chain
 
 ---
 
-## 1. Target & Reproducibility
+## Executive Summary
 
-| Item | Value |
-|------|-------|
-| Target Docker image | `twentycrm/twenty@sha256:fd6faa713fd2042d5d87e5705d47d24e492fc5202e7394e188f438085b483fad` |
-| Running release | **v2.8.3** (from `/client-config` → `appVersion`) |
-| Repo base commit (audit checkout) | `fc90b4ba8bb0a5d7c12c846fe9b2305527a0f7a8` |
-| Live instance | `http://audit-twenty-server:3000` on docker network `twenty-audit-net` |
-| Helper (attacker) image | `curlimages/curl@sha256:b3f1fb2a51d923260350d21b8654bbc607164a987e2f7c84a0ac199a67df812a` |
-| Listener image | `alpine@sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979713c2d4f` |
+This audit assessed Twenty CRM v2.8.3 (self-hosted Docker deployment) against a live, pinned instance. The codebase is broadly well-defended: SSRF, path traversal, SQL injection, cross-tenant IDOR, auth-token weaknesses, and upload XSS were all investigated and ruled out against the running build (see §4). One genuine object-level authorization defect was confirmed, plus one low-severity information-disclosure weakness.
 
-> **Version note (important for accuracy).** The repo is checked out at commit `fc90b4ba`, but the *running container* is release **v2.8.3**, whose compiled GraphQL schema and route guards differ from `fc90b4ba`. All API shapes, route patterns, guards, and config defaults cited in this report were verified against the **compiled code inside the running v2.8.3 container** (`/app/packages/twenty-server/dist/...`), not against `fc90b4ba` source.
+Strongest live-confirmed issue:
 
-**Reproduce (fully scripted, against the live pinned instance):**
-```bash
-bash autofyn_audit/setup.sh      # idempotent; verifies pinned digest, health, listener
-bash autofyn_audit/run_all.sh    # runs confirmed PoCs live; prints RESULT= + summary
-bash autofyn_audit/teardown.sh   # removes ONLY the attacker listener; leaves target intact
+- **TWENTY-001 (High) — Workflow-object RBAC bypass.** A single early-`return` in the ORM permission check (`validateOperationIsPermittedOrThrow`) skips record-permission enforcement for `isSystem` objects. For the workflow-related object class (`workflow`, `workflowRun`, `workflowVersion`) — which the permissions cache gates behind the `WORKFLOWS` settings flag — this lets a workspace member who is correctly denied on the dedicated workflow resolvers nonetheless read and write those objects through the generic GraphQL data API, leaking workflow-embedded `Authorization: Bearer` credentials and tampering with automations.
+
+The High finding is supported by an **end-to-end exploit chain** (CHAIN-01) proven live against the running instance: a restricted member steals an admin's workflow Bearer credential via the bypass and replays it against an external API to obtain protected data — elevating the impact from "readable field" to "compromise of an external account/credential held by the org." The chain's confirmed boundary is an authenticated low-privilege insider (PR:Low); it is not an unauthenticated attack.
+
+The Low/Informational finding (TWENTY-002) is an unauthenticated, captcha-less, unthrottled email-existence oracle (`checkUserExists`). It is reported as hardening guidance rather than a product vulnerability — it is a near-ubiquitous, accepted-risk UX pattern, and the platform already ships an opt-in captcha mitigation that simply defaults off.
+
+---
+
+## Evidence Types
+
+- **Direct Twenty Exploit** — PoC executed against Twenty's own running implementation; the documented effect (e.g. a low-privilege member reading/writing data its role forbids) reproduced live with a per-run random nonce asserted in the member's own response.
+- **Direct Twenty Exploit + Attacker Infrastructure** — PoC executed against the running instance with an attacker-controlled auxiliary service (a token-gated mock external API on the audit network) to prove downstream impact such as credential replay.
+- **Controlled Reproduction** — vulnerable code path confirmed by source/compiled-code review with limited live probing; behavior observed but not packaged as a self-asserting PoC.
+
+---
+
+## Findings Table
+
+| ID | Vulnerability | Severity | CVSS | Status | Evidence |
+|----|---------------|----------|------|--------|----------|
+| TWENTY-001 | Workflow-object RBAC bypass via `isSystem` early-return in `validateOperationIsPermittedOrThrow` (read/write `workflow`/`workflowRun`/`workflowVersion`, leaking embedded `Bearer` credentials) | High | 8.1 | Confirmed | Direct Twenty Exploit |
+| TWENTY-002 | Unauthenticated user/email enumeration via `checkUserExists` (no captcha, no rate-limit) | Low/Informational | 5.3 | Confirmed | Direct Twenty Exploit |
+
+---
+
+## Exploit Chains
+
+### Chain Evidence Matrix
+
+| Chain | Severity | Vulnerabilities | Exploit Script | Evidence |
+|-------|----------|-----------------|----------------|----------|
+| CHAIN-01 | High | TWENTY-001 | `exploits/chain_01_workflow_secret_to_external_compromise.sh` | Direct Twenty Exploit + Attacker Infrastructure |
+
+### CHAIN-01 — Workflow secret theft → external-account compromise
+
+**Severity:** High
+**Vulnerabilities:** TWENTY-001
+**Exploit script:** `exploits/chain_01_workflow_secret_to_external_compromise.sh`
+**Evidence tier:** Direct Twenty Exploit + Attacker Infrastructure
+
+This chain proves the TWENTY-001 read-bypass yields a **live external credential**, not just a readable field. The chain's entry point is an authenticated low-privilege insider (custom role, `canReadAllObjectRecords=false`, no `WORKFLOWS` flag) — it is **not** unauthenticated.
+
+**Attack flow:**
+1. An admin builds a legitimate automation: a workflow `HTTP_REQUEST` step that authenticates to a third-party API with `Authorization: Bearer <LIVE_SECRET>`. (Modeled by a token-gated mock service on the audit network that returns `PROTECTED-DATA-<nonce>` only for the exact token, and HTTP 401 + body `DENIED` otherwise.)
+2. A lowest-privilege insider reads the admin's Bearer token out of `workflowVersions{steps...settings.input.headers.Authorization}` via the TWENTY-001 `isSystem` bypass — despite having no role permission to read workflows (the same member is correctly DENIED on `companies`).
+3. The attacker replays the stolen token directly against the third-party API and receives `PROTECTED-DATA-<nonce>`; the same request with no token returns HTTP 401. The stolen credential grants live external access as the victim org.
+
+> **Honest scope note.** The *server-side* variant (member writes a malicious HTTP step then triggers it so the Twenty server exfiltrates the secret) is BLOCKED by `SettingsPermissionGuard(WORKFLOWS)` at the workflow resolvers, independent of the ORM bypass. The chain therefore uses **client-side replay** of the stolen credential — the action that actually works in default config and the realistic attacker move. The chain adds no new vulnerability; it strengthens the impact narrative for TWENTY-001 (and the C:H component of its CVSS).
+
+**Confirmed output** (per-run nonces differ each run; verdict shape is identical):
 ```
-`run_all.sh` executes six PoCs in order: `00_recon` (informational), `01_unauth_webhook_trigger`, `02_ssrf_via_webhook_http_request`, `03_user_enumeration_no_captcha`, `04_system_object_permission_bypass`, and `04b_system_object_blast_radius`. It prints a per-PoC `RESULT=` line and a final `N CONFIRMED / N total` count.
-
-> **Reading the runner output (important).** In `run_all.sh`, `RESULT=CONFIRMED` means *the mechanism the script exercises reproduced live* — it is NOT a statement that the mechanism is a product vulnerability. Only **two** of the reproduced mechanisms are reported as findings: **Finding 04 / 04b** (CRITICAL) and **Finding 03** (Medium). `01` and `02` reproduce their mechanisms on this test container but are **ruled out as product vulnerabilities in a default deployment** — see §4 for the precise reasons (01 requires possession of two unguessable 122-bit UUIDs; 02's internal/IMDS SSRF requires the non-default `OUTBOUND_HTTP_SAFE_MODE_ENABLED=false`). They are kept in the runner only so maintainers can observe the underlying behavior end-to-end.
+secret_planted=true
+stolen_by_restricted_member=true
+control_denied_on_companies=true
+replay_with_stolen_token=AUTHORIZED
+replay_without_token=DENIED
+RESULT=CONFIRMED exploit=chain_01_workflow_secret_to_external_compromise ::
+  restricted member (canReadAllObjectRecords=false) stole an admin workflow Bearer credential
+  via the TWENTY-001 isSystem RBAC bypass and replayed it for live access to an external API
+  (got PROTECTED-DATA); no-token control denied — impact = external credential compromise,
+  not just field read
+```
+The "stolen" assertion uses `grep -qF` on the **restricted member's own raw response** (not the admin's), and the no-token negative control is a hard gate (must return HTTP 401/403 + body `DENIED` and must NOT contain `PROTECTED-DATA`, else the run aborts without a CONFIRMED claim).
 
 ---
 
-## 2. Scope & Rules of Engagement
+## Vulnerability Details
 
-- **Audit only** — no changes were made to the target application.
-- **Live-confirmed only** — a vector is reported as a finding ONLY if a PoC produced `RESULT=CONFIRMED` against the live pinned instance. Suspected-but-unconfirmed code paths are listed in §4 as ruled-out or open, never as findings.
-- **Honest severity** — severity reflects real impact in a **default v2.8.3 deployment**. A weakness that is only reachable under a deliberately non-default/misconfigured environment is NOT reported as a product vulnerability.
-- **Independent findings** — each PoC is self-contained.
-- **No collateral** — the only container created by this audit is `audit-attacker-listener`; teardown removes only that.
+### TWENTY-001 — Workflow-object RBAC bypass via `isSystem` early-return
 
----
+**Severity:** High — CVSS 3.1 **8.1** `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N`
 
-## 3. Confirmed Findings
+**CWE:** CWE-863: Incorrect Authorization
 
-### Finding 04 — System-object permission bypass (RBAC bypass: cross-role read/write of all `isSystem` objects, including workflow-embedded secrets and email thread subjects)
+**Affected Code:**
+`packages/twenty-server/src/engine/twenty-orm/repository/permissions.utils.ts` — `validateOperationIsPermittedOrThrow` (lines 116–124; compiled as `dist/engine/twenty-orm/repository/permissions.utils.js`).
 
-**Severity: CRITICAL** (business impact: any authenticated workspace member, regardless of role, can read and modify every system object in the workspace — leaking embedded credentials and email thread subjects, and tampering with automations).
+**Description:**
+The ORM-level record-permission check returns early for any object with `isSystem === true` (except `workspaceMember`), *before* the `switch(operationType)` block that enforces `canReadObjectRecords` / `canUpdateObjectRecords` / `canSoftDeleteObjectRecords` / `canDestroyObjectRecords`. For the workflow-related object class (`workflow`, `workflowRun`, `workflowVersion`), the role-permissions cache computes record access as `hasWorkflowsPermissions` (the `WORKFLOWS` settings flag) — so a role *without* that flag has a cache-computed `canReadObjectRecords = false`. The dedicated workflow resolvers enforce `SettingsPermissionGuard(WORKFLOWS)` and correctly deny such a member, but the generic auto-generated GraphQL data API has no settings-permission guard and relies solely on the early-returning check. The result is an enforcement inconsistency: the generic data API serves (and mutates) workflow objects the member's computed permission forbids — including HTTP-step `Authorization: Bearer` credentials embedded in `workflowVersions.steps`.
 
-**CVSS 3.1:** `AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N` → **8.1 (High)**. Privileges-required is LOW because an authenticated workspace member account is required (PR:None would require no account at all, which is not what the live run demonstrates). The CVSS numeric score is 8.1/High; the qualitative CRITICAL rating reflects the concrete blast radius — secrets and write access — proven live.
-
-**Status: CONFIRMED live, deterministic across multiple independent runs** (re-verified 2/2 in the latest independent verification pass; reproduced on every run that reached the test phase).
-
-**Affected component (v2.8.3, compiled):**
-`/app/packages/twenty-server/dist/engine/twenty-orm/repository/permissions.utils.js` — `validateOperationIsPermittedOrThrow`:
-```js
+**Vulnerable Code:**
+```typescript
 const objectMetadataIsSystem = objectMetadata.isSystem === true;
 const isWorkspaceMemberObject =
-    objectMetadata.universalIdentifier === WORKSPACE_MEMBER_OBJECT_UNIVERSAL_IDENTIFIER;
+  objectMetadata.universalIdentifier ===
+  WORKSPACE_MEMBER_OBJECT_UNIVERSAL_IDENTIFIER;
+
+// TODO: this should be improved, we may have more complex permission configuration for is system objects
 if (objectMetadataIsSystem && !isWorkspaceMemberObject) {
-    return;  // early return BEFORE the switch(operationType) that enforces canReadObjectRecords
+  return; // returns BEFORE the switch(operationType) that enforces canReadObjectRecords, etc.
 }
 ```
-For any `isSystem===true` object except `workspaceMember`, the function returns before the `switch(operationType)` block that enforces `canReadObjectRecords`, `canUpdateObjectRecords`, `canSoftDeleteObjectRecords`, and `canDestroyObjectRecords`. Role record-permissions are silently ignored for the entire system-object class.
 
-**Threat model:** Any authenticated workspace member assigned a custom role with `canReadAllObjectRecords=false` — the lowest-privilege posture a workspace admin can configure. No admin account, no victim interaction, and no special knowledge beyond having a workspace account are required.
+**Scope (verified):** The early-return mechanically reaches *every* `isSystem` object, but only the workflow-related class is an actual privilege escalation. Other `isSystem` objects (`blocklist`, `messageThread`, …) are granted `canRead = true` unconditionally by the cache (`isSystem ? true`) and cannot be restricted by any role (`object-permission.service.ts` throws `CANNOT_ADD_OBJECT_PERMISSION_ON_SYSTEM_OBJECT`), so reading them is intended behavior — not an escalation. `message` bodies and `calendarEvent` details are additionally protected by independent visibility-restriction hooks the bypass does not defeat (see §4).
 
-**Reproduction:**
+**Attack Scenario:**
+A workspace admin assigns a low-trust member a custom role with `canReadAllObjectRecords=false` and without the `WORKFLOWS` permission. That member queries `workflowVersions` through the standard data API, reads an admin's embedded third-party `Bearer` token, and replays it off-platform — while the same member is correctly denied on `companies`/`people`/`workflows`.
+
+**Proof of Concept:**
 ```bash
-bash autofyn_audit/exploits/04_system_object_permission_bypass.sh   # core: secret plant + read/write bypass
-bash autofyn_audit/exploits/04b_system_object_blast_radius.sh       # blast radius across all isSystem objects
+# Core read/write bypass (plants a per-run random secret as admin, reads it back as the restricted member):
+bash autofyn_audit/exploits/04_system_object_permission_bypass.sh
+
+# End-to-end credential theft + external replay (CHAIN-01):
+bash autofyn_audit/exploits/chain_01_workflow_secret_to_external_compromise.sh
 ```
-Both scripts are included in `run_all.sh`.
-
-**Evidence (live runs against v2.8.3; reproduced deterministically across every independent run that reached the test phase):**
-
-Restricted member is correctly denied on non-system objects (all runs):
-```json
-{"data":{"companies":null},"errors":[{"message":"Entity performing the request does not have permission",
-  "extensions":{"userFriendlyMessage":"User does not have permission.",
-                "subCode":"PERMISSION_DENIED","code":"FORBIDDEN"}}]}
-```
-`code=FORBIDDEN subCode=PERMISSION_DENIED`, zero rows → `CONTROL_DENIED=true`. The `workflows` non-system object is denied identically (`workflows_denied=true`). RBAC is enforced for non-system objects, isolating the defect to the `isSystem` early-return.
-
-Same restricted member (a separate principal, `canReadAllObjectRecords=false`) reads the planted secret marker out of `workflowVersions{steps[].settings.input.headers.Authorization}` — an HTTP-step `Bearer` token planted by the admin and verified via an admin self-read assert — with no permission error, on every run.
-
-The marker is a **fresh per-run random nonce** of the form `SUPERSECRET-<32 hex chars>`; a maintainer re-running the PoC will see a different value each time (the PoC asserts the value it just planted, so this is not a hard-coded match). Representative values actually observed in independent verification runs:
-- `secret_marker=SUPERSECRET-98c786d7df1fab85d6313b5956d44c86` (run reading back `workflowVersionId=bdb4285b-...`) → `READ_BYPASS=true`
-- `secret_marker=SUPERSECRET-b27a3cfb862099a298aefe9be5292df2` (run reading back `workflowVersionId=453e263c-...`) → `READ_BYPASS=true`
-
-The read is a genuine cross-principal exfiltration: a low-privilege member reads a secret a higher-privilege admin embedded in a workflow the member has no role-permission to read.
-
-Same restricted member also writes a `workflowVersion` via `updateWorkflowVersion` (every run), despite `canUpdateAllObjectRecords=false`:
-```json
-{"data":{"updateWorkflowVersion":{"id":"<workflowVersionId>","name":"AuditWriteBypassed"}}}
-```
-`WRITE_BYPASS=true` — integrity impact, not just confidentiality.
-
-Representative RESULT line (per-run marker/id elided to `<...>`; the verdict shape is identical on every run):
+Confirmed live output (per-run marker elided):
 ```
 RESULT=CONFIRMED exploit=04_system_object_permission_bypass :: read_bypass=true control_denied=true
-  write_bypass=true workflows_denied=true secret_marker=SUPERSECRET-<32hex>
-  workflowVersionId=<uuid> :: member reads all workflowVersions.steps
-  (including embedded HTTP Authorization headers) despite role having no WORKFLOWS settings flag —
-  permissions.utils.js early-return for isSystem objects bypasses canRead=false enforcement;
-  company read correctly denied
+  write_bypass=true workflows_denied=true secret_marker=SUPERSECRET-<32hex> workflowVersionId=<uuid>
+  :: member reads all workflowVersions.steps (including embedded HTTP Authorization headers) despite
+  role having no WORKFLOWS settings flag — permissions.utils.js early-return for isSystem objects
+  bypasses canRead=false enforcement; company read correctly denied
 ```
 
-Blast-radius probe (`04b_system_object_blast_radius.sh`, verified live, **2/2 deterministic** in the latest independent verification) — same denied member, all isSystem queries accepted (no FORBIDDEN), while all non-system controls are correctly denied:
-
-```
-Object                           Bypassed  Rows
--------------------------------- --------- -----
-workflowVersions (system)        yes       2     (returns real records including planted secret)
-messageThreads   (system)        yes       0     (no email sync data in audit workspace; no FORBIDDEN)
-calendarEvents   (system)        yes       0     (ORM check bypassed; independent visibility hook filters
-                                                  events without calendarChannelAssociation — see note)
-messages/email bodies (system)   yes       0     (ORM check bypassed; independent visibility hook throws
-                                                  NOT_FOUND for messages without channelAssociation — see note)
-blocklists       (system)        yes       0     (no denial)
-workflowRuns     (system)        yes       0     (no denial)
-
-companies  (non-system)          DENIED    0     (FORBIDDEN/PERMISSION_DENIED)
-people     (non-system)          DENIED    0     (FORBIDDEN/PERMISSION_DENIED)
-workflows  (non-system)          DENIED    0     (FORBIDDEN/PERMISSION_DENIED)
-```
-
-Empty `edges:[]` for `messageThreads`, `calendarEvents`, `messages`, `blocklists`, and `workflowRuns` reflects the absence of integration data in the fresh audit workspace — NOT a denial for the objects without an independent visibility layer. The bypass signal is the absence of a FORBIDDEN error, not the row count.
-
-**Important scope correction (live-tested, round 9):** The ORM `isSystem` bypass reaches the `messages` and `calendarEvents` resolvers, but those resolvers run **independent application-layer visibility hooks** that the bypass does NOT defeat:
-- `apply-messages-visibility-restrictions.service.ts` (dist path: `dist/modules/messaging/common/query-hooks/message/apply-messages-visibility-restrictions.service.js`): throws `NotFoundError('Associated message channels not found')` — failing the entire `messages` query — when a message has no `messageChannelMessageAssociation` row. Even when a channel association exists, it redacts `subject`/`text` to `FIELD_RESTRICTED_ADDITIONAL_PERMISSIONS_REQUIRED` for any principal who is not the connected-account owner (visibility ≠ SHARE_EVERYTHING paths).
-- `apply-calendar-events-visibility-restrictions.service.ts` (dist path: `dist/modules/calendar/common/query-hooks/calendar-event/services/apply-calendar-events-visibility-restrictions.service.js`): splices out (filters to empty) any `calendarEvent` lacking a `calendarChannelEventAssociation` row; redacts `title`/`description` for non-owners when a channel exists.
-
-Live verification (round 9): admin-planted message and calendarEvent records were created successfully; subsequent read — even by the planting admin — returned `{"data":{"messages":null},"errors":[{"message":"Associated message channels not found","extensions":{"code":"NOT_FOUND"}}]}` and empty `calendarEvents.edges`. `messageThread.subject` was the ONLY item the round-9 plant exposed, consistent with 04b evidence: `messageThread` has no visibility hook. **Message bodies and calendar event details are NOT exposed via F04 in a v2.8.3 deployment with or without email/calendar sync.**
-
-**Impact:** The bypass spans the full system-object class — read AND write — for any restricted workspace member. Confirmed exposed objects (no independent visibility layer):
-- **Credentials leak:** workflow-embedded HTTP `Authorization: Bearer` tokens in `workflowVersions.steps`.
-- **Email thread subjects:** `messageThread.subject` (thread-level subjects; no visibility hook on `messageThread`).
-- **Automation tamper:** `workflowVersions` and `workflowRuns` writable by a denied member.
-- **Blocklist exposure:** `blocklists` readable (contact suppression data).
-
-NOT exposed via F04 (independently protected by visibility hooks — see blast-radius note above):
-- `message.subject` / `message.text` (email bodies): blocked by `apply-messages-visibility-restrictions.service` (NOT_FOUND throw or FIELD_RESTRICTED redaction).
-- `calendarEvent` fields (title, description, etc.): filtered to empty by `apply-calendar-events-visibility-restrictions.service`.
-
-Complete breakdown of object-level RBAC for the system-object class. Confidentiality and integrity both compromised.
-
-**Remediation (suggested to maintainers; not applied):**
-Remove the blanket `isSystem` early-return in `validateOperationIsPermittedOrThrow` so that system objects pass through the same `canReadObjectRecords`/`canUpdateObjectRecords`/`canSoftDeleteObjectRecords`/`canDestroyObjectRecords` enforcement as non-system objects. Treat `workspaceMember` as the narrow, documented exception rather than the entire `isSystem` class. If specific system objects must be world-readable within a workspace for operational reasons, add an explicit audited allowlist of object names — not a blanket class exemption.
-
-#### Finding 04 — Exploit Chain: end-to-end external-account compromise (impact proof)
-
-**The isolated F04 read-bypass is sometimes dismissed as "just a readable field." This chain proves the read yields a LIVE external credential.**
-
-End-to-end, in default v2.8.3 config:
-
-1. Admin builds a legitimate automation: a workflow HTTP_REQUEST step authenticating to a third-party API with `Authorization: Bearer <LIVE_SECRET>` (modeled by a mock service we stand up on the audit network that returns `PROTECTED-DATA-<nonce>` only for the exact token, 401 otherwise).
-2. A lowest-privilege insider (custom role, `canReadAllObjectRecords=false`) — entry is authenticated PR:Low, exactly like F04, NOT unauth — reads the admin's Bearer token out of `workflowVersions{steps...headers.Authorization}` via the F04 `isSystem` bypass, despite having no role permission to read workflows (same member is correctly DENIED on `companies`).
-3. The attacker replays the stolen token directly against the third-party API and receives `PROTECTED-DATA-<nonce>`; the same request with no token is denied (401). The stolen credential grants live external access as the victim org.
-
-**PoC:** `exploits/chain_01_workflow_secret_to_external_compromise.sh`. When all chain signals hold, the script prints `RESULT=CONFIRMED … restricted member … stole an admin workflow Bearer credential via the F04 isSystem RBAC bypass and replayed it for live access to an external API (got PROTECTED-DATA); no-token control denied`. Per-run nonces (`SUPERSECRET-<32hex>` / `PROTECTED-DATA-<32hex>`) — values differ each run; described in format, not pinned. **Live status: CONFIRMED, deterministic 2/2** in independent verification. Both runs: the restricted member's own response contained the planted `SUPERSECRET-<nonce>` (proven via `grep -qF` on the member's raw response, not the admin's), the same member was DENIED on `companies` (`FORBIDDEN`/`PERMISSION_DENIED`), the replay WITH the stolen token returned HTTP 200 + `PROTECTED-DATA-<nonce>` (AUTHORIZED), and the replay WITHOUT the token returned HTTP 401 + body `DENIED` (genuine negative control — no false positive). The mock is a single-connection `nc -lk -e handler` responder (an earlier two-`nc`-per-request model returned no HTTP response to curl and was replaced).
-
-**Note (honest scope):** The server-side variant (member writes a malicious HTTP step then triggers it so the Twenty server exfiltrates the secret) is BLOCKED by `SettingsPermissionGuard(WORKFLOWS)` at the workflow resolvers — independent of the ORM bypass. We therefore use client-side replay of the stolen credential, which is what works in default config and is the realistic attacker action. This chain does NOT add a new vulnerability; it elevates F04's demonstrated impact from "readable system-object field" to "compromise of an external account/credential held by the org," reinforcing the existing CRITICAL rating (no CVSS change required; the impact narrative is strengthened).
-
-*Optional recon context:* Finding 03 (unauth user enumeration) provides a pre-authenticated recon step — an attacker can enumerate whether a target org uses a Twenty instance before seeking a low-privilege workspace seat. This is framed as optional recon context only; it is not part of the confirmed chain, and the chain's confirmed boundary is authenticated PR:Low.
+**Remediation:**
+Make the generic data-API path honor the same permission the cache already computes, rather than short-circuiting it: for cache flag-gated system objects (the workflow-related set, alongside the existing `workspaceMember` handling), fall through to the normal `switch(operationType)` enforcement so a role lacking the `WORKFLOWS` flag is denied on the generic API exactly as on the dedicated resolvers. Objects the cache grants unconditionally can remain exempt (no role can restrict them anyway), which avoids regressing internal features that assume universally-readable system objects.
 
 ---
 
-### Finding 03 — Unauthenticated user/email enumeration via `checkUserExists` (no captcha, no rate-limit)
+### TWENTY-002 — Unauthenticated user/email enumeration via `checkUserExists`
 
-**Severity: Medium** (information disclosure; not a direct system compromise).
-**CVSS 3.1:** `AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N` → **5.3 (Medium)**.
+**Severity:** Low/Informational — CVSS 3.1 **5.3** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N`
 
-**Status: CONFIRMED live.**
+**CWE:** CWE-204: Observable Response Discrepancy
 
-**Affected component (v2.8.3, compiled):**
-- Auth resolver `checkUserExists(email)` query, served unauthenticated on the **`/metadata`** GraphQL endpoint (in v2.8.3 the `AuthResolver` is a `MetadataResolver`; the resolver is reachable without any token).
-- Captcha is a no-op in default config: the captcha service returns success when no captcha driver is configured. `/client-config` reports `captcha.driver: null` on this instance, confirming no captcha driver is active in the default Docker deployment.
+**Affected Code:**
+`packages/twenty-server/src/engine/core-modules/auth/auth.resolver.ts` — `checkUserExists` query (line 130), served on the unauthenticated `/metadata` GraphQL endpoint (`@MetadataResolver()`, guarded by `PublicEndpointGuard` + `NoPermissionGuard`). Captcha no-ops when no driver is configured: `packages/twenty-server/src/engine/core-modules/captcha/captcha.service.ts` returns `{ success: true }` when `CAPTCHA_DRIVER` is unset (the default).
 
-**Threat model:** Any unauthenticated, remote attacker. No account, token, or victim interaction required.
+**Description:**
+The `checkUserExists` query returns a distinguishable response for registered vs unregistered emails (`{exists:true,isEmailVerified:…}` vs `{exists:false}`), is reachable without authentication or a captcha token, and has no server-side rate limiting. This is a textbook account-existence oracle. It is reported as Low/Informational because it is an accepted-risk UX pattern for the "Continue with Email" flow and the platform already ships an opt-in captcha mitigation.
 
-**Reproduction:** `bash autofyn_audit/exploits/03_user_enumeration_no_captcha.sh`
-The PoC registers a throwaway account via `signUp` (to obtain a guaranteed-existing email), then issues `checkUserExists` for that email and for a random non-existent email — both **unauthenticated, with no `captchaToken`** — and measures rate-limiting over 30 sequential calls.
+**Attack Scenario:**
+An unauthenticated attacker scripts `checkUserExists` across an email list to build a validated set of accounts for phishing or password-spray, and to confirm whether a target organization uses the instance.
 
-**Evidence (observed live, v2.8.3):**
+**Proof of Concept:**
+```bash
+bash autofyn_audit/exploits/03_user_enumeration_no_captcha.sh
+```
+Confirmed live output:
 ```
 Known-existing email  → {"data":{"checkUserExists":{"exists":true,"isEmailVerified":false}}}
 Random absent email   → {"data":{"checkUserExists":{"exists":false}}}
-Rate-limit            → 30/30 sequential unauthenticated calls succeeded, 0 throttled (~10s)
-RESULT=CONFIRMED exploit=03_user_enumeration_no_captcha :: checkUserExists distinguishes
-  accounts (existing=true absent=false) with no Authorization header and no captchaToken
-  on /metadata; rate_limit=30/30 succeeded (no throttling observed)
+Rate-limit            → 30/30 sequential unauthenticated calls succeeded, 0 throttled
 ```
 
-**Impact:** A distinguishable existence oracle lets an attacker confirm whether any given email is registered on the instance. At scale (no captcha and no rate-limit observed) this enables:
-- Building a list of valid accounts for targeted **phishing** and **credential-stuffing / password-spray** campaigns.
-- Confirming whether specific individuals/organizations use the instance.
-The `isEmailVerified` flag additionally leaks per-account verification state.
+**Remediation:**
+Configure a captcha driver for `checkUserExists` in production and add IP-keyed server-side rate-limiting (e.g. `@nestjs/throttler`) on unauthenticated auth-surface queries; optionally return a uniform response to remove the oracle entirely.
 
-This is **not** a direct compromise (no auth bypass, no data theft beyond existence/verification state), hence Medium, not High/Critical.
+---
 
-**Remediation (suggested to maintainers; not applied):**
-1. Configure a captcha driver for `checkUserExists` in production, and add server-side rate-limiting (e.g. `@nestjs/throttler`) keyed on IP for unauthenticated auth-surface queries.
-2. Consider removing the existence oracle entirely (e.g. always return a uniform response, or fold the check into a flow that does not reveal existence).
+## Reproduction Instructions
+
+**Prerequisites:**
+- Docker with the pinned target running on network `twenty-audit-net`: `audit-twenty-server` (image `twentycrm/twenty@sha256:fd6faa713fd2…`), serving `v2.8.3`.
+- `setup.sh` verifies the pinned digest, health, and the attacker listener. Scripts are portable to stock macOS (Bash 3.2, BSD `head`, no `timeout`) and Linux/CI.
+
+**Run:**
+```bash
+bash autofyn_audit/setup.sh      # idempotent; verifies pinned digest, health, listener
+bash autofyn_audit/run_all.sh    # runs PoCs live; prints per-PoC RESULT= + a final N CONFIRMED / N total
+bash autofyn_audit/exploits/chain_01_workflow_secret_to_external_compromise.sh  # CHAIN-01 (manages its own mock)
+bash autofyn_audit/teardown.sh   # removes ONLY the attacker listener; leaves target intact
+```
+
+**Expected output:**
+- `04_system_object_permission_bypass` → `RESULT=CONFIRMED` (read_bypass=true, control_denied=true, write_bypass=true).
+- `04b_system_object_blast_radius` → `RESULT=CONFIRMED` (6/6 isSystem reached, 3/3 non-system controls denied).
+- `03_user_enumeration_no_captcha` → `RESULT=CONFIRMED` (existing=true / absent=false; 30/30 unthrottled).
+- `chain_01_…` → `RESULT=CONFIRMED` (stolen token AUTHORIZED at mock; no-token DENIED).
+
+> **Reading the runner output.** `RESULT=CONFIRMED` means the script's mechanism reproduced live — it is NOT a claim of product vulnerability. Only `04`/`04b` (TWENTY-001, High) and `03` (TWENTY-002, Low/Informational) are reported findings. `01` and `02` reproduce their mechanisms on the test container but are **ruled out as product vulnerabilities** in a default deployment (see §4): `01` requires possession of two unguessable 122-bit UUIDs; `02`'s internal/IMDS SSRF requires the non-default `OUTBOUND_HTTP_SAFE_MODE_ENABLED=false`.
+
+**Cleanup:**
+`bash autofyn_audit/teardown.sh` removes only the `audit-attacker-listener` container. The chain script removes its own mock container on exit. No changes are made to the target application.
 
 ---
 
 ## 4. Investigated and Ruled Out
 
-These vectors were examined against the compiled v2.8.3 code (and, where applicable, probed) and are **not** product vulnerabilities in a default deployment. They are documented for transparency and to scope future work.
+These vectors were examined against the compiled v2.8.3 code (and, where applicable, probed) and are **not** product vulnerabilities in a default deployment. They are documented for transparency.
 
-| # | Vector | Verdict | Reason (verified in v2.8.3) |
-|---|--------|---------|------------------------------|
-| 01 | Unauthenticated webhook trigger `POST /webhooks/workflows/:workspaceId/:workflowId` | **By design — not a vuln** | The endpoint is intentionally public (`PublicEndpointGuard`). Security rests on two unguessable 122-bit UUIDs (workspace id + workflow id) that the workflow owner shares with their integration, exactly like a GitHub/Stripe webhook URL. An attacker without those UUIDs cannot trigger anything; triggering one's own workflow is not an exploit. |
-| 02 | SSRF via `HTTP_REQUEST` workflow action / `testHttpRequest` | **Not a vuln in default config** | The outbound HTTP client is SSRF-hardened when `OUTBOUND_HTTP_SAFE_MODE_ENABLED` is on, and that flag **defaults to `true`** in v2.8.3 (`config-variables.js`). Only our test container explicitly set it to `false`. A default deployment blocks private-IP/metadata SSRF. Reporting this as a product vuln would be inaccurate. |
-| — | Path traversal on public file route `GET /file/public-assets/:workspaceId/:applicationId/*path` | **Not a vuln** | Four independent defenses: path normalization rejecting `..` segments, a per-segment `^[a-zA-Z0-9._-]+$` allowlist, a DB lookup requiring a matching `file` record before any byte is served, and `realpathSync` + storage-root containment check in the local driver. |
-| — | `/s/*path` public route-trigger (logic functions) | **Not exploitable in default config** | Fully public for all HTTP verbs, but logic-function execution is gated by `LOGIC_FUNCTION_TYPE`, which defaults to `DISABLED` in the standard Docker deployment, so no code executes. (Note for operators: if logic functions are enabled and a route's `isAuthRequired` is false, this becomes an unauthenticated cross-workspace invocation surface — worth hardening, but not exploitable as shipped.) |
-| — | Cross-workspace IDOR / tenant isolation | **Not a vuln** | The active workspace is derived from the verified JWT's `workspaceId` claim (`bindDataToRequestObject`), not from any client-supplied header or argument. Manipulating IDs/Origin does not cross tenants. |
-| — | Password-reset / token flows | **Not a vuln** | Reset tokens use `crypto.randomBytes(32)` (256-bit), are SHA-256-hashed at rest, and expire (5m). JWT verification pins a single-element `algorithms` array, preventing algorithm-confusion. |
-| — | SQL injection in dynamic record API (filter/orderBy) | **Not a vuln** | Filter keys are validated against a server-side metadata field allowlist (`fieldIdByName`) and rejected before any SQL is built; values are TypeORM-parameterized. |
-| — | File-upload stored XSS / upload abuse | **Not a vuln** | Magic-byte content-type detection, DOMPurify sanitization for SVG, and `Content-Disposition: attachment` for non-inline types (SVG is not inline-safe). Defense-in-depth holds. |
-| — | Predictable dev-seed invite hash (`apple.dev-invite-hash` / `yc.dev-invite-hash`) → unauthenticated workspace join via `signUpInWorkspace` | **Working as intended — not a product vuln** | The public invite-link feature is intentionally enabled (`isPublicInviteLinkEnabled` defaults to `true`), and an invite hash is a bearer credential by design (same model as a GitHub/Stripe invite URL). In **production**, `inviteHash` is a 122-bit UUID v4 — unguessable without prior exposure. The literal `apple.`/`yc.` hashes only exist in the **dev-seed demo workspaces** shipped for evaluation, not in real deployments. Reporting this as a vulnerability would misrepresent a demo-seed convenience as a product flaw. (Operator note: invite hashes never expire/rotate — worth hardening, but not a default-config product vuln.) |
-| — | Admin-panel config exposure (`getConfigVariablesGrouped`, `getDatabaseConfigVariable`) | **Not a vuln** | `isSensitive` values are masked by `maskSensitiveValue()` before return, and the resolvers are double-gated by `AdminPanelGuard` (server-level superadmin) + `SettingsPermissionGuard(SECURITY)`. Not reachable by regular members/admins. |
-| — | Cross-workspace role assignment via user-supplied `roleId` (`updateWorkspaceMemberRole`, `upsertObjectPermissions`) | **Not a vuln** | Role lookups resolve against workspace-scoped flat maps (`flatRoleMaps`/`universalIdentifierById` loaded for the caller's `workspaceId`); a foreign `roleId` is undefined and throws `ROLE_NOT_FOUND`/`FlatEntityMapsException` before any assignment. |
-| — | SNS/SES inbound webhook subscription-confirmation SSRF | **Not exploitable in default config** | SNS signature verification runs before the subscription-confirmation fetch, and the topic must be in `SES_SNS_TOPIC_ARN_ALLOWLIST` (empty by default → rejected). |
-| — | OAuth `redirectLocation` open redirect (`connection-provider-oauth.controller.ts`) | **Low / not a vuln** | `redirectLocation` is carried in an `APP_SECRET`-signed state JWT and applied via `url.pathname`; the Node `URL.pathname` setter cannot change the host, so the redirect stays same-host. |
+| Vector | Verdict | Reason (verified in v2.8.3) |
+|--------|---------|------------------------------|
+| Unauthenticated webhook trigger `POST /webhooks/workflows/:workspaceId/:workflowId` | **By design — not a vuln** | Endpoint is intentionally public (`PublicEndpointGuard`). Security rests on two unguessable 122-bit UUIDs (workspace id + workflow id) the owner shares with their integration, like a GitHub/Stripe webhook URL. Without those UUIDs an attacker cannot trigger anything; triggering one's own workflow is not an exploit. |
+| SSRF via `HTTP_REQUEST` workflow action / `testHttpRequest` | **Not a vuln in default config** | The outbound HTTP client is SSRF-hardened when `OUTBOUND_HTTP_SAFE_MODE_ENABLED` is on, and that flag **defaults to `true`** in v2.8.3 (`config-variables.js`). Only the test container set it to `false`. A default deployment blocks private-IP/metadata SSRF. |
+| Path traversal on `GET /file/public-assets/:workspaceId/:applicationId/*path` | **Not a vuln** | Four independent defenses: `..`-segment rejection, a per-segment `^[a-zA-Z0-9._-]+$` allowlist, a DB lookup requiring a matching `file` record before any byte is served, and `realpathSync` + storage-root containment in the local driver. |
+| `/s/*path` public route-trigger (logic functions) | **Not exploitable in default config** | Fully public for all verbs, but logic-function execution is gated by `LOGIC_FUNCTION_TYPE`, which defaults to `DISABLED` in the standard Docker deployment. (Operator note: if logic functions are enabled and a route's `isAuthRequired` is false, this becomes an unauthenticated cross-workspace invocation surface — worth hardening, not exploitable as shipped.) |
+| Cross-workspace IDOR / tenant isolation | **Not a vuln** | The active workspace is derived from the verified JWT's `workspaceId` claim (`bindDataToRequestObject`), not from any client-supplied header or argument. |
+| Password-reset / token flows | **Not a vuln** | Reset tokens use `crypto.randomBytes(32)` (256-bit), are SHA-256-hashed at rest, and expire (5m). JWT verification pins a single-element `algorithms` array, preventing algorithm-confusion. |
+| SQL injection in dynamic record API (filter/orderBy) | **Not a vuln** | Filter keys are validated against a server-side metadata field allowlist (`fieldIdByName`) and rejected before any SQL is built; values are TypeORM-parameterized. |
+| File-upload stored XSS / upload abuse | **Not a vuln** | Magic-byte content-type detection, DOMPurify sanitization for SVG, and `Content-Disposition: attachment` for non-inline types. |
+| Predictable dev-seed invite hash (`apple.`/`yc.dev-invite-hash`) → unauthenticated workspace join | **Working as intended — not a product vuln** | The public invite-link feature is intentional (`isPublicInviteLinkEnabled` defaults `true`); an invite hash is a bearer credential by design. In production `inviteHash` is a 122-bit UUID v4. The literal `apple.`/`yc.` hashes exist only in the dev-seed demo workspaces, not real deployments. (Operator note: invite hashes never expire/rotate — worth hardening.) |
+| Admin-panel config exposure (`getConfigVariablesGrouped`, `getDatabaseConfigVariable`) | **Not a vuln** | `isSensitive` values are masked by `maskSensitiveValue()` before return; resolvers are double-gated by `AdminPanelGuard` (superadmin) + `SettingsPermissionGuard(SECURITY)`. |
+| Cross-workspace role assignment via user-supplied `roleId` | **Not a vuln** | Role lookups resolve against workspace-scoped flat maps loaded for the caller's `workspaceId`; a foreign `roleId` is undefined and throws `ROLE_NOT_FOUND`/`FlatEntityMapsException` before any assignment. |
+| SNS/SES inbound webhook subscription-confirmation SSRF | **Not exploitable in default config** | SNS signature verification runs before the subscription-confirmation fetch, and the topic must be in `SES_SNS_TOPIC_ARN_ALLOWLIST` (empty by default → rejected). |
+| OAuth `redirectLocation` open redirect (`connection-provider-oauth.controller.ts`) | **Low / not a vuln** | `redirectLocation` is carried in an `APP_SECRET`-signed state JWT and applied via `url.pathname`; the Node `URL.pathname` setter cannot change the host, so the redirect stays same-host. |
+| **TWENTY-001 → mass email body / calendar event exfiltration** | **Ruled out — live-tested** | `message` and `calendarEvent` ARE `isSystem=true`, so the ORM bypass IS reached — but both run independent application-layer visibility hooks the bypass does not defeat. `apply-messages-visibility-restrictions.service.ts` (line 92–93) throws `NotFoundError('Associated message channels not found')` — failing the entire `messages` query — for any message without a `messageChannelMessageAssociation` row (and redacts `subject`/`text` to `FIELD_RESTRICTED_ADDITIONAL_PERMISSIONS_REQUIRED` for non-owners even when a channel exists). `apply-calendar-events-visibility-restrictions.service.ts` (line 135) splices out events without a `calendarChannelEventAssociation`, reducing `edges` to empty. Live evidence: admin-planted nonce-marked `message`/`calendarEvent` records were created, but a subsequent read — even by the planting admin — returned `messages:null` (`code:NOT_FOUND`) and empty `calendarEvents.edges`. Only `messageThread.subject` (no visibility hook) read back, and `messageThread` is unconditionally member-readable by design. Confirmed negative: TWENTY-001 does not expose email bodies or calendar event details. |
 
-| — | **F04 → mass email body / calendar event exfiltration** | **RULED OUT — live-tested round 9** | `message` and `calendarEvent` ARE `isSystem=true`, so the ORM `validateOperationIsPermittedOrThrow` bypass IS reached — but both object types run independent application-layer visibility hooks that F04 does not bypass. `apply-messages-visibility-restrictions.service.ts` (`src/modules/messaging/common/query-hooks/message/apply-messages-visibility-restrictions.service.ts`, line 92–93) throws `NotFoundError('Associated message channels not found')` — failing the entire `messages` query — for any message without a `messageChannelMessageAssociation` row; even with a channel, it redacts `subject`/`text` to `FIELD_RESTRICTED_ADDITIONAL_PERMISSIONS_REQUIRED` for principals who do not own the connected account. `apply-calendar-events-visibility-restrictions.service.ts` (`src/modules/calendar/common/query-hooks/calendar-event/services/apply-calendar-events-visibility-restrictions.service.ts`, line 135) splices (filters out) events without a `calendarChannelEventAssociation`, reducing `edges` to empty. Round-9 live evidence: admin planted nonce-marked `createMessage` + `createCalendarEvent` records (creates succeeded, ids returned); subsequent `messages` read by the same planting admin returned `{"data":{"messages":null},"errors":[{"message":"Associated message channels not found","extensions":{"code":"NOT_FOUND"}}]}`; `calendarEvents` returned empty edges. Only `messageThread.subject` (no visibility hook) read back successfully — consistent with 04b. This is a confirmed negative: F04's confidentiality blast radius does NOT include email bodies or calendar event details. |
-
-> **Round-6 second-finding hunt (transparency).** A dedicated pass over impersonation (`canImpersonate`), the admin panel, SSO/Google/Microsoft OAuth state and `returnToPath` handling, invitation/2FA flows, the REST API, billing/messaging webhooks, row-level permission predicates, and API-key minting found **no additional independent critical/high product vulnerability** beyond Finding 04. The candidates examined are recorded above. This confirms the codebase is otherwise well-defended; Finding 04 stands as the single critical issue.
+> **Second-finding hunt (transparency).** A dedicated pass over impersonation (`canImpersonate`), the admin panel, SSO/Google/Microsoft OAuth state and `returnToPath` handling, invitation/2FA flows, the REST API, billing/messaging webhooks, row-level permission predicates, and API-key minting found **no additional independent high/critical product vulnerability** beyond TWENTY-001. The codebase is otherwise well-defended.
 
 ---
 
-## 5. Posture Summary
+## Conclusion
 
-This audit confirmed **one CRITICAL object-level RBAC bypass** and **one Medium information-disclosure weakness** against the live v2.8.3 pinned instance.
+Twenty CRM v2.8.3 is broadly well-defended against the common critical attack classes — the audit ruled out SSRF, path traversal, SQLi, tenant-isolation IDOR, auth-token weaknesses, and upload XSS against the running build. The one systemic issue is an authorization-layering inconsistency: object-record permissions are computed correctly in the role cache (including the `WORKFLOWS`-flag gate for workflow objects), but the generic data-API enforcement path short-circuits that computation for `isSystem` objects via a single early-`return`. That gap turns a settings-permission boundary into a no-op on the generic API for the workflow-object class, exposing embedded third-party credentials.
 
-The CRITICAL finding (Finding 04) is a complete breakdown of role-based record-permission enforcement for the `isSystem=true` object class. Any authenticated workspace member, regardless of role restrictions, can read and write every system object lacking an independent visibility layer — including workflow-embedded credentials, email thread subjects, blocklists, and automation run state. Note: `message` bodies and `calendarEvent` details are NOT exposed via this bypass; they are protected by separate visibility-restriction hooks (`apply-messages-visibility-restrictions.service` / `apply-calendar-events-visibility-restrictions.service`) that operate independently of the ORM permission check (see §4). The root cause is a single unconditional early-return in compiled server code (`permissions.utils.js`) that predates any role-permission check.
+**Priority remediation order:**
+1. **TWENTY-001 (High):** Stop early-returning for cache flag-gated system objects in `validateOperationIsPermittedOrThrow`; honor the computed `canReadObjectRecords`/`canUpdateObjectRecords`/etc. so the generic data API matches the dedicated workflow resolvers.
+2. **TWENTY-002 (Low/Informational):** Enable a captcha driver and add IP-keyed rate-limiting on unauthenticated auth-surface queries; consider a uniform `checkUserExists` response.
 
-The Medium finding (Finding 03) is an unauthenticated email-existence oracle with no captcha and no rate-limit in the default deployment.
+---
 
-The common critical attack classes — SSRF, path traversal, SQLi, IDOR/tenant-isolation, auth-token weaknesses, upload XSS — were investigated and ruled out (§4). That hardening is genuine but does not offset the severity of the RBAC bypass.
+## Files Delivered
 
-**Files:**
-- `setup.sh` / `run_all.sh` / `teardown.sh` — scripted setup, live PoC run, and safe teardown.
-- `lib/common.sh` — v2.8.3 auth helpers (`/metadata` endpoint, `signUp`/workspace bootstrap, enumeration oracle helper).
-- `exploits/00_recon.sh` — environment recon (informational).
-- `exploits/03_user_enumeration_no_captcha.sh` — confirmed Finding 03 PoC (Medium).
-- `exploits/04_system_object_permission_bypass.sh` — confirmed Finding 04 PoC: core RBAC bypass with planted secret, read and write (CRITICAL).
-- `exploits/04b_system_object_blast_radius.sh` — confirmed Finding 04 blast-radius probe: uniform bypass across all isSystem objects (CRITICAL, companion to 04).
-- `exploits/01_*`, `exploits/02_*` — **mechanism demonstrations, RULED OUT as product vulnerabilities** (see §4). They are run by `run_all.sh` so maintainers can observe the behavior end-to-end; their `RESULT=CONFIRMED` denotes a reproduced mechanism, NOT a finding.
+```
+autofyn_audit/
+├── audit_report.md                              # this report
+├── README.md                                    # quick-start + finding summary
+├── setup.sh                                     # verify pinned digest, health, listener
+├── run_all.sh                                   # run PoCs live; print RESULT= + summary
+├── teardown.sh                                  # remove only the attacker listener
+├── lib/
+│   └── common.sh                                # v2.8.3 auth helpers (/metadata, signUp/bootstrap, oracle)
+├── exploits/
+│   ├── 00_recon.sh                              # environment recon (informational)
+│   ├── 01_unauth_webhook_trigger.sh             # RULED OUT mechanism demo (§4)
+│   ├── 02_ssrf_via_webhook_http_request.sh      # RULED OUT mechanism demo (§4)
+│   ├── 03_user_enumeration_no_captcha.sh        # TWENTY-002 PoC (Low/Informational)
+│   ├── 04_system_object_permission_bypass.sh    # TWENTY-001 PoC: read/write bypass (High)
+│   ├── 04b_system_object_blast_radius.sh        # TWENTY-001 mechanism probe (companion)
+│   └── chain_01_workflow_secret_to_external_compromise.sh  # CHAIN-01 impact proof (High)
+└── docs/
+    └── CVE-TWENTY-001.md                         # advisory for the High finding
+```

@@ -46,10 +46,33 @@ EXPLOITS=(
 # Per-exploit wall-clock cap (seconds)
 EXPLOIT_TIMEOUT=120
 
+# Portable timeout resolution.
+# GNU coreutils ships `timeout`; macOS/BSD does not (it may have `gtimeout` via
+# `brew install coreutils`). Fall back to a no-op wrapper so the runner still
+# executes the PoCs on stock macOS — the per-exploit caps are advisory, not
+# load-bearing for a CONFIRMED verdict.
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+fi
+run_with_timeout() {
+    # usage: run_with_timeout <seconds> <cmd...>
+    local secs="$1"; shift
+    if [[ -n "$TIMEOUT_BIN" ]]; then
+        "$TIMEOUT_BIN" "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Run loop
 # ---------------------------------------------------------------------------
-declare -A RESULTS
+# Indexed array of "name: RESULT_LINE" entries — Bash 3.2 compatible (stock
+# macOS ships Bash 3.2, which has no associative arrays / `declare -A`).
+RESULT_ENTRIES=()
 TOTAL=0
 CONFIRMED=0
 
@@ -68,7 +91,7 @@ for exploit_file in "${EXPLOITS[@]}"; do
     # Run exploit in subshell with timeout; capture output; never abort run
     set +e
     EXPLOIT_EXIT=0
-    EXPLOIT_OUTPUT=$(timeout "$EXPLOIT_TIMEOUT" bash "$exploit_path" 2>&1) || EXPLOIT_EXIT=$?
+    EXPLOIT_OUTPUT=$(run_with_timeout "$EXPLOIT_TIMEOUT" bash "$exploit_path" 2>&1) || EXPLOIT_EXIT=$?
     set -e
 
     echo "$EXPLOIT_OUTPUT"
@@ -88,7 +111,7 @@ for exploit_file in "${EXPLOITS[@]}"; do
         fi
     fi
 
-    RESULTS["$exploit_name"]="$RESULT_LINE"
+    RESULT_ENTRIES+=("${exploit_name}: ${RESULT_LINE}")
 
     if echo "$RESULT_LINE" | grep -q 'RESULT=CONFIRMED'; then
         CONFIRMED=$((CONFIRMED + 1))
@@ -101,8 +124,8 @@ done
 echo "======================================"
 echo "  AUDIT RUN SUMMARY"
 echo "======================================"
-for exploit_name in "${!RESULTS[@]}"; do
-    echo "  ${exploit_name}: ${RESULTS[$exploit_name]}"
+for entry in "${RESULT_ENTRIES[@]}"; do
+    echo "  ${entry}"
 done | sort
 echo "--------------------------------------"
 echo "  ${CONFIRMED} CONFIRMED / ${TOTAL} total"
