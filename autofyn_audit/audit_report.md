@@ -255,5 +255,6 @@ autofyn_audit/
 │   ├── 04b_system_object_blast_radius.sh        # TWENTY-001 mechanism probe (companion)
 │   └── chain_01_workflow_secret_to_external_compromise.sh  # CHAIN-01 impact proof (High)
 └── docs/
-    └── CVE-TWENTY-001.md                         # advisory for the High finding
+    ├── CVE-TWENTY-001.md                         # advisory for the High finding
+    └── CVE-TWENTY-002.md                         # advisory for the Low/Informational finding
 ```
